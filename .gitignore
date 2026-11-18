@@ -1,0 +1,13 @@
+# Runtime artifacts - never commit these
+HotspotReport.txt
+HotspotBootFix.log
+*.reg
+hotspot-settings.json
+reservations.csv
+FallbackHotspot.txt
+Start-Hotspot-Fallback.bat
+
+# OS junk
+Thumbs.db
+desktop.ini
+.DS_Store
