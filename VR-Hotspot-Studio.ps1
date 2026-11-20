@@ -330,6 +330,14 @@ function Start-Hotspot {
     $ch = (netsh wlan show interfaces) 2>&1 | Out-String
     $bandLine  = [regex]::Match($ch, 'Band\s*:\s*(\S+)').Groups[1].Value
     $chanLine  = [regex]::Match($ch, 'Channel\s*:\s*(\d+)').Groups[1].Value
+    if (-not $chanLine) {
+        # localized netsh output (e.g. Chinese) - match the words via char codes
+        # so this file stays pure ASCII: 0x6CE2+0x6BB5 = bo-duan, 0x4FE1+0x9053 = xin-dao
+        $patBand = [string][char]0x6CE2 + [string][char]0x6BB5
+        $patChan = [string][char]0x4FE1 + [string][char]0x9053
+        $bandLine = [regex]::Match($ch, $patBand + '\s*:\s*(\S+)').Groups[1].Value
+        $chanLine = [regex]::Match($ch, $patChan + '\s*:\s*(\d+)').Groups[1].Value
+    }
     Log "Band follows uplink: currently $bandLine channel $chanLine (5 GHz requires a 5 GHz uplink)"
 
     # 3a. router mode: own NAT + own DHCP with reservations
@@ -362,8 +370,6 @@ function Start-Hotspot {
         $sync.PoolStart = 100; $sync.PoolEnd = 200
         $sync.Reservations = @{}
         foreach ($r in (Load-Reservations)) { $sync.Reservations[$r.mac] = $r.ip }
-        $script:DhcpRun = [powershell]::Create()
-        $script:DhcpRun.RunspacePool = $null
         $script:DhcpRun = [powershell]::Create().AddScript($DhcpSource).AddArgument($sync)
         $script:DhcpHandle = $script:DhcpRun.BeginInvoke()
         Log "Built-in DHCP started (reservations from reservations.csv)"
