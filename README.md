@@ -13,8 +13,10 @@ found" - this kit is for you. The headline app sidesteps all of it.
 
 ## Quick start (60 seconds)
 
-1. **Download**: click the green **`<> Code`** button at the top of this page
-   -> **Download ZIP** (or `git clone` the URL it shows).
+1. **Download**: grab **`vr-hotspot-kit.zip`** from the **Releases**
+   section (bottom of the right sidebar, or the "Releases" tag under the
+   file list) - just the runnable files, no git needed. Prefer the whole
+   codebase instead? Green **`<> Code`** button -> **Download ZIP**.
 2. Extract the ZIP anywhere (right-click -> Extract All).
 3. **Stop any other hotspot app** (MyPublicWiFi, Windows Mobile Hotspot
    toggle - one Wi-Fi radio can run only one hotspot).
