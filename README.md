@@ -1,9 +1,15 @@
 # VR Hotspot Kit
 
+# [Download the latest release](https://github.com/diiiamondmaster/vr-hotspot-kit/releases)
+
+Grab **`vr-hotspot-kit-vX.X.X.zip`** from the Releases page - just the
+runnable files, no git needed. Extract and run
+**`VR-Hotspot-Studio.bat`** as Administrator.
+
+---
+
 A standalone Wi-Fi hotspot app for Windows that **does not depend on the
-Windows Mobile Hotspot stack at all** - plus the complete diagnostic and
-repair toolkit that was built while tracking down why that stack broke on a
-debloated ("tiny11") Windows 11 machine.
+Windows Mobile Hotspot stack at all**.
 
 If Windows says *"We can't set up mobile hotspot"*, the toggle flips itself
 back off, or `GetTetheringCapability` throws `0x83120006` / "Element not
@@ -13,10 +19,11 @@ found" - this kit is for you. The headline app sidesteps all of it.
 
 ## Quick start (60 seconds)
 
-1. **Download**: grab **`vr-hotspot-kit.zip`** from the **Releases**
-   section (bottom of the right sidebar, or the "Releases" tag under the
-   file list) - just the runnable files, no git needed. Prefer the whole
-   codebase instead? Green **`<> Code`** button -> **Download ZIP**.
+1. **Download**: grab **`vr-hotspot-kit.zip`** from the [Releases
+   page](https://github.com/diiiamondmaster/vr-hotspot-kit/releases)
+   (link at the top of this README too) - just the runnable files, no git
+   needed. Prefer the whole codebase instead? Green **`<> Code`** button
+   -> **Download ZIP**.
 2. Extract the ZIP anywhere (right-click -> Extract All).
 3. **Stop any other hotspot app** (MyPublicWiFi, Windows Mobile Hotspot
    toggle - one Wi-Fi radio can run only one hotspot).
@@ -81,30 +88,12 @@ docs/
   TROUBLESHOOTING.md            symptoms -> fixes for app and Windows stack
   PRINTER-STATIC-IP.md          giving a 3D printer a fixed address
   PUBLISHING.md                 how to publish/update this repo on GitHub
-repair/                         diagnostic + repair scripts (the saga's tools)
 ```
 
-## The repair kit (`repair/`)
-
-Each script attacks one layer of the Windows Mobile Hotspot stack. They were
-built during the diagnosis, in the order that made sense to rule things out,
-and are kept because each is independently useful on any machine.
-
-| Script | What it does |
-| --- | --- |
-| `Hotspot-Doctor` | full diagnosis report (services, radios, BT tree, NCSI, drivers) - writes `HotspotReport.txt` |
-| `Hotspot-Capability-Check` | asks Windows for the official tethering verdict (`GetTetheringCapability`) - the fastest way to see the real error |
-| `VPN-Hotspot-Test` | tests whether a VPN (Tailscale etc.) is the culprit |
-| `Hotspot-5GHz-Setup` | configures the *Windows* hotspot to 5 GHz via the tethering API (needs a working tethering stack) |
-| `Driver-Rollback` | lists all stored Wi-Fi drivers, rolls back, re-tests |
-| `Restore-MobileHotspot` | deep repair of the icssvc service chain + registry fixes + legacy fallback |
-| `Hotspot-BootFix` | for hotspots that die on reboot; installs an at-logon fix task |
-| `Hotspot-DeepClean` | removes ghost Wi-Fi Direct adapters + stale ICS bindings |
-| `Hotspot-Store-Reset` | backs up and resets the icssvc settings store (with .reg backup) |
-| `Hotspot-Surgical-Repair` | DISM component-store repair from a mounted ISO - no setup.exe, no re-bloat, keeps apps/data |
-
-All of them are `.bat`/`.ps1` pairs: double-click the `.bat`, accept the
-Administrator prompt. Windows PowerShell 5.1 only; nothing to install.
+(The diagnostic/repair scripts built during the original troubleshooting
+were removed from the repo in v1.0.2 - the hotspot app made them
+unnecessary. They remain in the git history under `repair/` in older tags,
+e.g. `v1.0.1`.)
 
 ## Troubleshooting
 
@@ -123,8 +112,7 @@ most common items:
 The kit was developed on a machine whose Windows 11 Mobile Hotspot broke
 permanently after a tiny11 stripping accident (details:
 [docs/THE-SAGA.md](docs/THE-SAGA.md)). Rather than re-bloat the OS to repair
-one component, the fix became an app that doesn't need the component. The
-diagnostic scripts stayed because the reasoning trail is half the value.
+one component, the fix became an app that doesn't need the component.
 
 ## Security note
 

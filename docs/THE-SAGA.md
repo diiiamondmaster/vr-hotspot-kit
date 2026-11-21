@@ -6,6 +6,10 @@ because (a) it documents a genuinely interesting Windows failure mode, and
 (b) anyone hitting the same wall can compare notes instead of redoing three
 days of debugging.
 
+> Note: the diagnostic/repair scripts this document describes were removed
+> from the repo in v1.0.2 (the app replaced them). They remain in the git
+> history under `repair/` in older tags, e.g. `v1.0.1`.
+
 ## The machine
 
 | Component | Detail |

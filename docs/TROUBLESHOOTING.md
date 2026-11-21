@@ -1,5 +1,10 @@
 # Troubleshooting
 
+> Note: the diagnostic/repair scripts mentioned below (Capability Check,
+> Surgical Repair, etc.) were removed from the repo in v1.0.2 now that the
+> app makes them unnecessary. They live in the git history under `repair/`
+> in older tags (e.g. `v1.0.1`) if ever needed.
+
 ## The app
 
 ### "Publisher ABORTED (driver refused the AP)" right after START
