@@ -7,6 +7,25 @@
 
 ## The app
 
+### The hotspot works but the connection stalls for a second every few minutes
+That is Windows' WLAN AutoConfig background scanning - the radio leaves your
+channel to look for other networks. The app's **VR mode** (on by default)
+pauses those scans while the hotspot runs. If you are still seeing dropouts
+with VR mode on, check the **latency graph**: red bars while the green line
+is otherwise flat = radio-level interference; red bars with spiky green =
+client-side Wi-Fi issues (distance, 2.4 GHz, power saving on the headset).
+
+### Windows can't find new networks / the uplink won't reconnect while the hotspot runs
+That is VR mode working as designed: scans are paused for an unbroken
+connection. Stop the hotspot to resume scanning. If the app crashed while
+VR mode was on, simply launch it again - it detects the leftover
+`vrmode.flag` and resumes scanning automatically.
+
+### Latency graph shows "NO REPLY" but the connection works
+The graph pings the FIRST client in the Connected devices list. If that
+device sleeps (printers do), pick a different situation or ignore it - the
+ping target follows the top of the list.
+
 ### "Publisher ABORTED (driver refused the AP)" right after START
 Another program is already holding the Wi-Fi radio's AP role, or the Wi-Fi
 radio is busy. In order:

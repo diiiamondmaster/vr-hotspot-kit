@@ -45,6 +45,23 @@ That is it. The app needs no installation, no .NET downloads, no dependencies
   devices that need a fixed address (see
   [docs/PRINTER-STATIC-IP.md](docs/PRINTER-STATIC-IP.md))
 - **Connected-clients list** (name / IP / MAC, names from your reservations)
+- **VR mode** (on by default): pauses Windows' background Wi-Fi scans while
+  the hotspot runs - that scanning is what causes the every-few-minutes
+  dropout that breaks rhythm games like Beat Saber. Scans resume
+  automatically when the hotspot stops, the app closes, or on the next
+  launch after a crash (crash-safe flag file)
+- **Adapter power saving is always disabled** while the hotspot runs - no
+  toggle, by design (Realtek power saving causes micro-stutters)
+- **Auto-start on launch** (optional checkbox)
+- **Live latency graph**: pings the first connected client twice a second;
+  green line = milliseconds, red bars = dropouts, so connection health is
+  visible at a glance
+- **System tray integration**: minimizes to the hidden-icons area with its
+  own green signal-wave icon; right-click menu (open / start / stop / exit)
+  and balloon notifications on start/stop
+- **Copy SSID+pass button** for the clipboard
+- Static-IP reservations can be filled in by **picking a connected device
+  from a dropdown** - no typing MAC addresses
 - **Live log** with band/channel display
 - No telemetry, no background services, nothing installed - close the
   window and everything is gone (settings are kept in two small files next
@@ -67,6 +84,15 @@ channel **follows your uplink connection's channel** - connect the PC to a
 5 GHz network and the hotspot runs 5 GHz too (driver-governed; the app
 shows the live band/channel in the log at start).
 
+### VR mode - what it trades away
+
+While VR mode is active, Windows does not scan for networks, which means
+it also **will not notice network changes**: if the uplink network drops
+and comes back, Windows may not reconnect until the hotspot is stopped.
+That is exactly the tradeoff rhythm gamers want (unbroken latency beats
+auto-reconnect), but it is the first thing to turn off if your uplink is
+flaky. The checkbox state is remembered between runs.
+
 ### Requirements
 
 - Windows 10 or 11, any edition, with the built-in Windows PowerShell 5.1
@@ -74,6 +100,14 @@ shows the live band/channel in the log at start).
 - A Wi-Fi adapter with Wi-Fi Direct support (virtually all modern laptops/
   USB dongles; if Windows' own hotspot ever worked on the machine, this
   will too)
+
+### Files created at runtime (next to the scripts)
+
+- `hotspot-settings.json` - your settings
+- `reservations.csv` - static IP reservations
+- `vrmode.flag` - crash-safety marker while VR mode has Wi-Fi scans paused
+  (deleted automatically when scans resume; if the app ever crashes while
+  running, the next launch cleans it up)
 
 ---
 

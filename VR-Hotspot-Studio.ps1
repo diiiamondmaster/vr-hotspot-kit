@@ -20,6 +20,14 @@
      a built-in DHCP server with per-MAC static IP reservations -
      ideal for printers that need a fixed address.
 
+ VR MODE (checkbox, on by default): pauses Windows' background Wi-Fi
+ scans while the hotspot runs - that scanning is what causes the
+ every-few-minutes dropout in VR. Scans resume automatically when the
+ hotspot stops, the app closes, or on the next launch after a crash.
+ Power saving on the Wi-Fi adapters is ALWAYS disabled while the
+ hotspot runs - no toggle, by design (Realtek power saving causes
+ micro-stutters).
+
  About 5 GHz: this API does not expose a band switch. The hotspot
  channel follows your uplink connection's channel. Connect the PC
  to a 5 GHz network (like your current ch161) and the hotspot runs
@@ -58,6 +66,12 @@ $sync              = [hashtable]::Synchronized(@{})
 $sync.Log          = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
 $sync.Leases       = [hashtable]::Synchronized(@{})
 $sync.Stop         = $false
+$sync.StopMonitor  = $false
+$sync.PingTarget   = $null
+$sync.PingHist     = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
+$VrFlagFile        = Join-Path $ScriptDir 'vrmode.flag'
+$script:MonitorRun    = $null
+$script:MonitorHandle = $null
 
 $ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
 $SettingsFile = Join-Path $ScriptDir 'hotspot-settings.json'
@@ -83,8 +97,8 @@ function Load-Settings {
 }
 
 function Save-Settings {
-    param($ssid, $pass, $uplink, $routerMode)
-    $o = [pscustomobject]@{ ssid = $ssid; pass = $pass; uplink = $uplink; routerMode = $routerMode }
+    param($ssid, $pass, $uplink, $routerMode, $vrmode, $autostart)
+    $o = [pscustomobject]@{ ssid = $ssid; pass = $pass; uplink = $uplink; routerMode = $routerMode; vrmode = $vrmode; autostart = $autostart }
     $o | ConvertTo-Json | Set-Content -Path $SettingsFile -Encoding ASCII
 }
 
@@ -116,6 +130,39 @@ function Get-WfdAdapter {
     Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue |
         Where-Object { $_.InterfaceDescription -match 'Wi-Fi Direct' -and $_.Status -ne 'Disconnected' } |
         Select-Object -First 1
+}
+
+function Get-PhysicalWifi {
+    Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
+        Where-Object { $_.PhysicalMediaType -like '*802.11*' } | Select-Object -First 1
+}
+
+function Disable-AdapterPowerSaving([string]$name) {
+    try {
+        Disable-NetAdapterPowerManagement -Name $name -NoRestart -ErrorAction Stop | Out-Null
+        Log "Power saving disabled on '$name' (always off in this app, by design)"
+    } catch { Log "Could not disable power saving on '$name': $($_.Exception.Message)" }
+}
+
+function Enable-VRMode {
+    $w = Get-PhysicalWifi
+    if (-not $w) { Log 'VR mode: no physical Wi-Fi adapter found - scans not paused.'; return }
+    netsh wlan set autoconfig enabled=no interface="$($w.Name)" 2>&1 | Out-Null
+    Set-Content -Path $VrFlagFile -Value $w.Name -Encoding ASCII
+    Log "VR mode ON : background Wi-Fi scans paused on '$($w.Name)' (dropout fix)"
+    Log '  Windows will not react to network changes until the hotspot stops.'
+}
+
+function Disable-VRMode {
+    if (Test-Path $VrFlagFile) {
+        $wname = [string](Get-Content $VrFlagFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+        if (-not $wname) { $w = Get-PhysicalWifi; if ($w) { $wname = $w.Name } }
+        if ($wname) {
+            netsh wlan set autoconfig enabled=yes interface="$wname" 2>&1 | Out-Null
+            Log "VR mode OFF: background Wi-Fi scans resumed on '$wname'"
+        }
+        Remove-Item $VrFlagFile -ErrorAction SilentlyContinue
+    }
 }
 
 # ---------- ICS sharing (Shared mode) ----------
@@ -278,10 +325,31 @@ Log "DHCP server stopped"
 '@
 
 # =====================================================================
+# latency monitor source (runs in a background runspace)
+# =====================================================================
+$MonitorSource = @'
+param($sync)
+$ping = New-Object System.Net.NetworkInformation.Ping
+while (-not $sync.StopMonitor) {
+    $t = $sync.PingTarget
+    if ($t) {
+        $ms = -1
+        try {
+            $r = $ping.Send($t, 400)
+            if ($r.Status.ToString() -eq 'Success') { $ms = [int]$r.RoundtripTime }
+        } catch { }
+        $sync.PingHist.Add($ms) | Out-Null
+        if ($sync.PingHist.Count -gt 120) { $sync.PingHist.RemoveRange(0, $sync.PingHist.Count - 120) }
+    }
+    Start-Sleep -Milliseconds 500
+}
+'@
+
+# =====================================================================
 # start / stop logic
 # =====================================================================
 function Start-Hotspot {
-    param([string]$ssid, [string]$pass, [string]$uplinkName, [bool]$routerMode)
+    param([string]$ssid, [string]$pass, [string]$uplinkName, [bool]$routerMode, [bool]$vrMode)
 
     # 0. refuse if another hotspot holds the radio
     $busy = Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue |
@@ -340,6 +408,12 @@ function Start-Hotspot {
     }
     Log "Band follows uplink: currently $bandLine channel $chanLine (5 GHz requires a 5 GHz uplink)"
 
+    # power saving off on both adapters - always, by design
+    $physWifi = Get-PhysicalWifi
+    if ($physWifi) { Disable-AdapterPowerSaving $physWifi.Name }
+    if ($script:VAdapter) { Disable-AdapterPowerSaving $script:VAdapter.Name }
+    if ($vrMode) { Enable-VRMode }
+
     # 3a. router mode: own NAT + own DHCP with reservations
     if ($routerMode) {
         Disable-AllIcs
@@ -396,6 +470,7 @@ function Stop-Hotspot {
     }
     try { Get-NetNat -Name VRHotspotNAT -ErrorAction SilentlyContinue | Remove-NetNat -Confirm:$false } catch { }
     try { Disable-AllIcs } catch { }
+    try { Disable-VRMode } catch { }
     if ($script:Pub) {
         try { $script:Pub.Stop() } catch { }
         Log "Hotspot stopped."
@@ -440,7 +515,7 @@ function New-Group([string]$text, [int]$x, [int]$y, [int]$w, [int]$h) {
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'VR Hotspot Studio'
-$form.Size = New-Object System.Drawing.Size(580, 860)
+$form.Size = New-Object System.Drawing.Size(580, 1032)
 $form.StartPosition = 'CenterScreen'
 $form.BackColor = $dark
 $form.FormBorderStyle = 'FixedSingle'
@@ -469,6 +544,12 @@ $cbShow.Size = New-Object System.Drawing.Size(60, 22); $cbShow.ForeColor = $gray
 $cbShow.BackColor = $dark; $cbShow.Font = $font
 $cbShow.Add_Click({ $tPass.UseSystemPasswordChar = -not $cbShow.Checked })
 $gHot.Controls.Add($cbShow)
+$btnCopy = New-Object System.Windows.Forms.Button
+$btnCopy.Text = 'Copy SSID+pass'
+$btnCopy.Location = New-Object System.Drawing.Point(270, 24)
+$btnCopy.Size = New-Object System.Drawing.Size(104, 26)
+$btnCopy.FlatStyle = 'Flat'; $btnCopy.BackColor = $darker; $btnCopy.ForeColor = $white; $btnCopy.Font = $font
+$gHot.Controls.Add($btnCopy)
 
 $btnStart = New-Object System.Windows.Forms.Button
 $btnStart.Text = 'START HOTSPOT'
@@ -487,7 +568,7 @@ $btnStop.FlatStyle = 'Flat'; $btnStop.Font = $font
 $gHot.Controls.Add($btnStop)
 
 # ---------- sharing group ----------
-$gShare = New-Group 'Internet sharing' 16 190 544 84
+$gShare = New-Group 'Internet sharing' 16 190 544 112
 $form.Controls.Add($gShare)
 $lUp = New-Label 'Uplink' 14 30 60; $gShare.Controls.Add($lUp)
 $cbUp = New-Object System.Windows.Forms.ComboBox
@@ -501,9 +582,21 @@ $cbRouter.Location = New-Object System.Drawing.Point(14, 58)
 $cbRouter.Size = New-Object System.Drawing.Size(430, 22)
 $cbRouter.ForeColor = $gray; $cbRouter.BackColor = $dark; $cbRouter.Font = $font
 $gShare.Controls.Add($cbRouter)
+$cbAuto = New-Object System.Windows.Forms.CheckBox
+$cbAuto.Text = 'Auto-start on launch'
+$cbAuto.Location = New-Object System.Drawing.Point(14, 84)
+$cbAuto.Size = New-Object System.Drawing.Size(180, 22)
+$cbAuto.ForeColor = $gray; $cbAuto.BackColor = $dark; $cbAuto.Font = $font
+$gShare.Controls.Add($cbAuto)
+$cbVR = New-Object System.Windows.Forms.CheckBox
+$cbVR.Text = 'VR mode (pause Windows Wi-Fi scans while running)'
+$cbVR.Location = New-Object System.Drawing.Point(210, 84)
+$cbVR.Size = New-Object System.Drawing.Size(330, 22)
+$cbVR.ForeColor = $gray; $cbVR.BackColor = $dark; $cbVR.Font = $font
+$gShare.Controls.Add($cbVR)
 
 # ---------- clients group ----------
-$gClients = New-Group 'Connected devices' 16 280 544 150
+$gClients = New-Group 'Connected devices' 16 318 544 150
 $form.Controls.Add($gClients)
 $lvClients = New-Object System.Windows.Forms.ListView
 $lvClients.Location = New-Object System.Drawing.Point(14, 24)
@@ -517,7 +610,7 @@ foreach ($c in @(@('Name', 180), @('IP', 120), @('MAC', 160))) {
 $gClients.Controls.Add($lvClients)
 
 # ---------- reservations group ----------
-$gResv = New-Group 'Static IP reservations (Router mode)' 16 436 544 150
+$gResv = New-Group 'Static IP reservations (Router mode)' 16 474 544 150
 $form.Controls.Add($gResv)
 $lvResv = New-Object System.Windows.Forms.ListView
 $lvResv.Location = New-Object System.Drawing.Point(14, 24)
@@ -543,8 +636,20 @@ $btnResDel.Size = New-Object System.Drawing.Size(106, 30)
 $btnResDel.FlatStyle = 'Flat'; $btnResDel.BackColor = $darker; $btnResDel.ForeColor = $white; $btnResDel.Font = $font
 $gResv.Controls.Add($btnResDel)
 
+# ---------- latency group ----------
+$gLat = New-Group 'Latency (live ping to the first connected client)' 16 630 544 128
+$form.Controls.Add($gLat)
+$lblPing = New-Label 'Latency: waiting for a client...' 14 22 500
+$gLat.Controls.Add($lblPing)
+$pbLat = New-Object System.Windows.Forms.PictureBox
+$pbLat.Location = New-Object System.Drawing.Point(14, 44)
+$pbLat.Size = New-Object System.Drawing.Size(516, 70)
+$pbLat.BackColor = [System.Drawing.Color]::FromArgb(20, 20, 20)
+$pbLat.BorderStyle = 'FixedSingle'
+$gLat.Controls.Add($pbLat)
+
 # ---------- log group ----------
-$gLog = New-Group 'Log' 16 592 544 190
+$gLog = New-Group 'Log' 16 766 544 190
 $form.Controls.Add($gLog)
 $tbLog = New-Object System.Windows.Forms.TextBox
 $tbLog.Location = New-Object System.Drawing.Point(14, 24)
@@ -559,10 +664,96 @@ $gLog.Controls.Add($tbLog)
 # ---------- status bar ----------
 $status = New-Object System.Windows.Forms.Label
 $status.Text = 'Status: idle'
-$status.Location = New-Object System.Drawing.Point(20, 790)
+$status.Location = New-Object System.Drawing.Point(20, 964)
 $status.Size = New-Object System.Drawing.Size(540, 24)
 $status.ForeColor = $gray; $status.Font = $fontB
 $form.Controls.Add($status)
+
+# =====================================================================
+# app icon, system tray, latency graph
+# =====================================================================
+function Make-Icon {
+    $bmp = New-Object System.Drawing.Bitmap 32, 32
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $g.Clear([System.Drawing.Color]::FromArgb(32, 32, 36))
+    $greenIc = [System.Drawing.Color]::FromArgb(63, 195, 128)
+    $brush = New-Object System.Drawing.SolidBrush $greenIc
+    $g.FillEllipse($brush, 9, 21, 5, 5)
+    $pen = New-Object System.Drawing.Pen $greenIc, 3
+    $g.DrawArc($pen, 4, 16, 12, 12, 220, 100)
+    $g.DrawArc($pen, 0, 12, 20, 20, 220, 100)
+    $g.DrawArc($pen, -4, 8, 28, 28, 220, 100)
+    $g.Dispose()
+    return [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
+}
+$script:AppIcon = Make-Icon
+$form.Icon = $script:AppIcon
+
+function Show-MainForm {
+    $form.WindowState = 'Normal'
+    $form.Show()
+    $form.Activate()
+}
+
+$notifyIcon = New-Object System.Windows.Forms.NotifyIcon
+$notifyIcon.Icon = $script:AppIcon
+$notifyIcon.Text = 'VR Hotspot Studio'
+$notifyIcon.Visible = $true
+$trayMenu = New-Object System.Windows.Forms.ContextMenuStrip
+[void]$trayMenu.Items.Add('Open VR Hotspot Studio')
+[void]$trayMenu.Items.Add('Start hotspot')
+[void]$trayMenu.Items.Add('Stop hotspot')
+[void]$trayMenu.Items.Add('-')
+[void]$trayMenu.Items.Add('Exit')
+$notifyIcon.ContextMenuStrip = $trayMenu
+$trayMenu.Items[0].Add_Click({ Show-MainForm })
+$trayMenu.Items[1].Add_Click({ Invoke-StartHotspot })
+$trayMenu.Items[2].Add_Click({ Invoke-StopHotspot })
+$trayMenu.Items[4].Add_Click({ $form.Close() })
+$notifyIcon.Add_DoubleClick({ Show-MainForm })
+$form.Add_Resize({
+    if ($form.WindowState -eq 'Minimized') { $form.Hide() }
+})
+
+function Draw-Sparkline {
+    if (-not $pbLat) { return }
+    $w = $pbLat.Width; $h = $pbLat.Height
+    $bmp = New-Object System.Drawing.Bitmap $w, $h
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.Clear([System.Drawing.Color]::FromArgb(20, 20, 20))
+    $hist = @($sync.PingHist)
+    $n = $hist.Count
+    if ($n -gt 1) {
+        $maxV = 30
+        foreach ($v in $hist) { if ($v -gt $maxV) { $maxV = $v } }
+        $spacing = [double]($w - 4) / 119.0
+        $penGreen = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(63, 195, 128)), 2
+        $penRed   = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(232, 72, 72)), 2
+        $prevX = -1.0; $prevY = -1.0
+        for ($i = 0; $i -lt $n; $i++) {
+            $v = $hist[$i]
+            $x = [double]($w - 2) - ($n - 1 - $i) * $spacing
+            if ($v -lt 0) {
+                $g.DrawLine($penRed, [single]$x, 3, [single]$x, ($h - 4))
+                $prevX = -1.0
+            } else {
+                $y = [double]($h - 4) - ($v / $maxV) * ($h - 10)
+                if ($prevX -ge 0) { $g.DrawLine($penGreen, [single]$prevX, [single]$prevY, [single]$x, [single]$y) }
+                $prevX = $x; $prevY = $y
+            }
+        }
+        $penGreen.Dispose(); $penRed.Dispose()
+        $lastV = $hist[$n - 1]
+        if ($lastV -ge 0) { $lblPing.Text = ('Latency: {0} ms   (last {1} s, red = dropout)' -f $lastV, [int]($n / 2)) }
+        else { $lblPing.Text = 'Latency: NO REPLY from the client' }
+    } else {
+        $lblPing.Text = 'Latency: waiting for a connected client...'
+    }
+    $g.Dispose()
+    if ($pbLat.Image) { $pbLat.Image.Dispose() }
+    $pbLat.Image = $bmp
+}
 
 # =====================================================================
 # GUI behavior
@@ -587,41 +778,68 @@ function Refresh-Uplinks {
 
 $script:Running = $false
 
-$btnStart.Add_Click({
+function Invoke-StartHotspot {
     $btnStart.Enabled = $false
     try {
         $uplink = $cbUp.SelectedItem
         if (-not $uplink) { Log 'No uplink selected.'; return }
-        Save-Settings $tSsid.Text $tPass.Text $uplink ([bool]$cbRouter.Checked)
-        $ok = Start-Hotspot -ssid $tSsid.Text -pass $tPass.Text -uplinkName $uplink -routerMode ([bool]$cbRouter.Checked)
+        Save-Settings $tSsid.Text $tPass.Text $uplink ([bool]$cbRouter.Checked) ([bool]$cbVR.Checked) ([bool]$cbAuto.Checked)
+        $ok = Start-Hotspot -ssid $tSsid.Text -pass $tPass.Text -uplinkName $uplink -routerMode ([bool]$cbRouter.Checked) -vrMode ([bool]$cbVR.Checked)
         $script:Running = $ok
         if ($ok) {
             $status.Text = "Status: RUNNING  -  SSID '$($tSsid.Text)'"
             $status.ForeColor = $green
+            try { $notifyIcon.ShowBalloonTip(2500, 'Hotspot started', "SSID: $($tSsid.Text)", [System.Windows.Forms.ToolTipIcon]::Info) } catch { }
         }
     } finally { $btnStart.Enabled = $true }
-})
+}
 
-$btnStop.Add_Click({
+function Invoke-StopHotspot {
     Stop-Hotspot
     $script:Running = $false
     $status.Text = 'Status: idle'
     $status.ForeColor = $gray
+    try { $notifyIcon.ShowBalloonTip(2000, 'Hotspot stopped', 'Wi-Fi scans resumed.', [System.Windows.Forms.ToolTipIcon]::Info) } catch { }
+}
+
+$btnStart.Add_Click({ Invoke-StartHotspot })
+$btnStop.Add_Click({ Invoke-StopHotspot })
+
+$btnCopy.Add_Click({
+    try {
+        [System.Windows.Forms.Clipboard]::SetText("SSID: $($tSsid.Text)   Password: $($tPass.Text)")
+        Log 'SSID and password copied to the clipboard.'
+    } catch { Log "Clipboard copy failed: $($_.Exception.Message)" }
 })
 
 $btnResAdd.Add_Click({
     $f = New-Object System.Windows.Forms.Form
-    $f.Text = 'Add reservation'; $f.Size = New-Object System.Drawing.Size(340, 190)
+    $f.Text = 'Add reservation'; $f.Size = New-Object System.Drawing.Size(340, 268)
     $f.StartPosition = 'CenterParent'; $f.BackColor = $dark; $f.FormBorderStyle = 'FixedDialog'
-    $l1 = New-Label 'Device name' 12 14 100;  $f.Controls.Add($l1)
-    $t1 = New-Box 12 34 300;                 $f.Controls.Add($t1)
-    $l2 = New-Label 'MAC address (any format)' 12 62 200; $f.Controls.Add($l2)
-    $t2 = New-Box 12 82 300;                 $f.Controls.Add($t2)
-    $l3 = New-Label 'Static IP' 12 110 100;  $f.Controls.Add($l3)
-    $t3 = New-Box 12 130 160;                $f.Controls.Add($t3)
+    $l0 = New-Label 'Pick a connected device (fills the fields)' 12 12 300; $f.Controls.Add($l0)
+    $cbPick = New-Object System.Windows.Forms.ComboBox
+    $cbPick.Location = New-Object System.Drawing.Point(12, 32)
+    $cbPick.Size = New-Object System.Drawing.Size(300, 24)
+    $cbPick.BackColor = $darker; $cbPick.ForeColor = $white; $cbPick.FlatStyle = 'Flat'; $cbPick.Font = $font
+    foreach ($it in $lvClients.Items) { [void]$cbPick.Items.Add(('{0}  {1}  {2}' -f $it.Text, $it.SubItems[1].Text, $it.SubItems[2].Text)) }
+    $cbPick.Add_SelectedIndexChanged({
+        $parts = ($cbPick.Text -split '\s{2,}')
+        if ($parts.Count -ge 3) {
+            $t2.Text = $parts[2]
+            if ($parts[0] -ne 'client' -and $parts[0] -notmatch '^[0-9a-f:]{12,17}$') { $t1.Text = $parts[0] }
+            if ($t3.Text -eq '192.168.137.50') { $t3.Text = $parts[1] }
+        }
+    })
+    $f.Controls.Add($cbPick)
+    $l1 = New-Label 'Device name' 12 66 100;  $f.Controls.Add($l1)
+    $t1 = New-Box 12 86 300;                  $f.Controls.Add($t1)
+    $l2 = New-Label 'MAC address (any format)' 12 114 200; $f.Controls.Add($l2)
+    $t2 = New-Box 12 134 300;                 $f.Controls.Add($t2)
+    $l3 = New-Label 'Static IP' 12 162 100;   $f.Controls.Add($l3)
+    $t3 = New-Box 12 182 160;                 $f.Controls.Add($t3)
     $t3.Text = '192.168.137.50'
     $ok = New-Object System.Windows.Forms.Button
-    $ok.Text = 'Save'; $ok.Location = New-Object System.Drawing.Point(236, 128)
+    $ok.Text = 'Save'; $ok.Location = New-Object System.Drawing.Point(236, 180)
     $ok.Size = New-Object System.Drawing.Size(76, 28); $ok.FlatStyle = 'Flat'
     $ok.BackColor = $accent; $ok.ForeColor = $white
     $ok.Add_Click({
@@ -660,7 +878,7 @@ $timer.Add_Tick({
         $tbLog.ScrollToCaret()
     }
     $tbLog.Tag = $sync.Log.Count
-    if (-not $script:Running) { return }
+    if (-not $script:Running) { $sync.PingTarget = $null; return }
 
     # publisher health
     if ($script:Pub) {
@@ -703,12 +921,25 @@ $timer.Add_Tick({
                 $lvClients.Items.Add($item) | Out-Null
             }
         } catch { }
+
+        # latency target = first connected client
+        if ($lvClients.Items.Count -gt 0) { $sync.PingTarget = $lvClients.Items[0].SubItems[1].Text }
+        else { $sync.PingTarget = $null }
+        Draw-Sparkline
     }
 })
 
 $form.Add_FormClosing({
     if ($script:Running) { Stop-Hotspot }
+    $sync.StopMonitor = $true
+    if ($script:MonitorHandle) {
+        try { $script:MonitorRun.Stop(); $script:MonitorRun.Dispose() } catch { }
+        $script:MonitorRun = $null; $script:MonitorHandle = $null
+    }
+    try { Disable-VRMode } catch { }
     $timer.Stop()
+    $notifyIcon.Visible = $false
+    try { $notifyIcon.Dispose() } catch { }
 })
 
 # ---------- init ----------
@@ -717,18 +948,39 @@ if ($cfg) {
     $tSsid.Text = $cfg.ssid
     $tPass.Text = $cfg.pass
     $cbRouter.Checked = [bool]$cfg.routerMode
+    if ($null -ne $cfg.vrmode) { $cbVR.Checked = [bool]$cfg.vrmode } else { $cbVR.Checked = $true }
+    $cbAuto.Checked = [bool]$cfg.autostart
 }
 else {
     $tSsid.Text = 'VR-Link'
     $tPass.Text = -join ((48..57)+(65..90)+(97..122) | Get-Random -Count 12 | ForEach-Object { [char]$_ })
+    $cbVR.Checked = $true
 }
 $tPass.UseSystemPasswordChar = $true
 Refresh-Uplinks
 Refresh-ResvList
+
+# crash recovery: if the app died while VR mode had scans paused, resume them
+if (Test-Path $VrFlagFile) {
+    Disable-VRMode
+    Log 'Crash recovery: Wi-Fi scans had been left paused - resumed now.'
+}
+
+# latency monitor runspace (pings the current target twice a second)
+$script:MonitorRun = [powershell]::Create().AddScript($MonitorSource).AddArgument($sync)
+$script:MonitorHandle = $script:MonitorRun.BeginInvoke()
+
 Log 'Welcome. This hotspot uses Wi-Fi Direct (wlansvc), not the broken'
 Log 'Windows tethering stack - it works even though Settings cannot.'
 Log 'One hotspot per radio: stop MyPublicWiFi before starting this.'
 if ($cfg -and $cfg.uplink -and $cbUp.Items.Contains($cfg.uplink)) { $cbUp.SelectedItem = $cfg.uplink }
+
+$form.Add_Shown({
+    if ($cbAuto.Checked) {
+        Log 'Auto-start enabled - bringing the hotspot up...'
+        Invoke-StartHotspot
+    }
+})
 
 $timer.Start()
 [void]$form.ShowDialog()
