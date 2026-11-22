@@ -95,3 +95,28 @@ industry-wide; Wi-Fi Direct replaced it. Nothing to fix.
 ### Bluetooth audio is broken too
 Separate tiny11 casualty: the `BthAvctpSvc` service is missing from the
 image. The Surgical Repair (DISM from ISO) can restore it as well.
+
+## VR Hotspot Studio
+
+### Startup printed "Join-Path ... Path is null" (v2.0.0 only)
+v2.0.0 built `vrmode.flag`'s path from the script-folder variable two
+lines before that variable existed. The app still ran, but the VR-mode
+crash-recovery flag never worked and the errors were noisy. Fixed in
+v2.1.0 - upgrade (Downloads below always point at the newest release).
+
+### Static IP reservations did not stick (v1.x / v2.0.0)
+The reservation list and the built-in DHCP server used two different
+MAC formats (with vs. without colons), so a reservation never matched
+the device asking for an address. Fixed in v2.1.0: MACs are normalized
+everywhere, and reservations can be added/removed while the hotspot
+runs - reconnect the device (Wi-Fi off/on) to pick up the new address.
+
+### The window does not fit my screen
+Since v2.1.0 the window scrolls instead of getting cut off on small
+displays.
+
+### "Another hotspot adapter is UP"
+Only one hotspot can hold the Wi-Fi radio. Stop MyPublicWiFi (or any
+other hotspot app) first. Since v2.1.0 restarting the hotspot right
+after stopping it also works - the app waits for the old virtual
+adapter to disappear.

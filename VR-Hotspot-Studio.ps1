@@ -1,6 +1,6 @@
 <#
 =====================================================================
- VR-Hotspot-Studio.ps1
+ VR-Hotspot-Studio.ps1  v2.1.0
  A standalone Wi-Fi hotspot app that does NOT depend on the Windows
  Mobile Hotspot (icssvc/tethering) stack at all.
 
@@ -18,64 +18,67 @@
      (NAT 192.168.137.x, Windows' own DHCP).
    ROUTER MODE (advanced): the app itself runs NAT (New-NetNat) and
      a built-in DHCP server with per-MAC static IP reservations -
-     ideal for printers that need a fixed address.
+     ideal for printers that need a fixed address. Reservations can
+     be added or removed while the hotspot is running.
 
  VR MODE (checkbox, on by default): pauses Windows' background Wi-Fi
- scans while the hotspot runs - that scanning is what causes the
- every-few-minutes dropout in VR. Scans resume automatically when the
- hotspot stops, the app closes, or on the next launch after a crash.
- Power saving on the Wi-Fi adapters is ALWAYS disabled while the
- hotspot runs - no toggle, by design (Realtek power saving causes
- micro-stutters).
+   scans while the hotspot runs - that scanning is what causes the
+   every-few-minutes dropout in VR. Scans resume automatically when
+   the hotspot stops, the app closes, or on the next launch after a
+   crash (vrmode.flag + a temp-folder fallback). Power saving on the
+   Wi-Fi adapters is ALWAYS disabled while the hotspot runs - no
+   toggle, by design (Realtek power saving causes micro-stutters).
 
  About 5 GHz: this API does not expose a band switch. The hotspot
- channel follows your uplink connection's channel. Connect the PC
- to a 5 GHz network (like your current ch161) and the hotspot runs
- 5 GHz too. The app displays the live channel.
+   channel follows your uplink connection's channel. Connect the PC
+   to a 5 GHz network (like your current ch161) and the hotspot runs
+   5 GHz too. The app displays the live channel.
 
  Requirements: run as Administrator. Only ONE hotspot can hold the
  Wi-Fi radio - stop MyPublicWiFi etc. before starting this one.
+
+ Testing: the script has a self-test hook (VRHS_SELFTEST=1) that
+ skips elevation and the GUI so the core logic (settings,
+ reservations, VR-mode flag handling, the DHCP server) can be
+ exercised by an automated test harness on any machine.
 =====================================================================
 #>
 
 $ErrorActionPreference = 'Continue'
+$SelfTest   = ($env:VRHS_SELFTEST -eq '1')
+$AppVersion = '2.1.0'
 
-# ---------- elevation ----------
-$id = [Security.Principal.WindowsIdentity]::GetCurrent()
-$pr = New-Object Security.Principal.WindowsPrincipal($id)
-if (-not $pr.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Add-Type -AssemblyName System.Windows.Forms
-    [System.Windows.Forms.MessageBox]::Show('Please run VR-Hotspot-Studio.bat as Administrator.', 'Elevation required') | Out-Null
-    exit 1
-}
-
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
-Add-Type -AssemblyName System.Runtime.WindowsRuntime
-
-[Windows.Devices.WiFiDirect.WiFiDirectAdvertisementPublisher,Windows.Devices.WiFiDirect,ContentType=WindowsRuntime] | Out-Null
+# =====================================================================
+# script location - MUST be resolved before anything that uses it
+# (v2.0.0 bug: $VrFlagFile was built from $ScriptDir two lines
+#  before $ScriptDir existed, causing the Join-Path null errors)
+# =====================================================================
+if ($PSScriptRoot)                            { $ScriptDir = $PSScriptRoot }
+elseif ($MyInvocation.MyCommand.Path)         { $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path }
+else                                          { $ScriptDir = (Get-Location).Path }
+$SettingsFile = Join-Path $ScriptDir 'hotspot-settings.json'
+$ResvFile     = Join-Path $ScriptDir 'reservations.csv'
+$VrFlagFile   = Join-Path $ScriptDir 'vrmode.flag'
+$VrFlagAlt    = Join-Path ([System.IO.Path]::GetTempPath()) 'vrhs-vrmode.flag'
 
 # =====================================================================
 # state
 # =====================================================================
-$script:Pub        = $null
-$script:VAdapter   = $null      # the Wi-Fi Direct virtual adapter
-$script:DhcpRun    = $null      # runspace for router mode
-$script:DhcpHandle= $null
-$sync              = [hashtable]::Synchronized(@{})
-$sync.Log          = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
-$sync.Leases       = [hashtable]::Synchronized(@{})
-$sync.Stop         = $false
-$sync.StopMonitor  = $false
-$sync.PingTarget   = $null
-$sync.PingHist     = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
-$VrFlagFile        = Join-Path $ScriptDir 'vrmode.flag'
-$script:MonitorRun    = $null
+$script:Pub         = $null
+$script:VAdapter    = $null      # the Wi-Fi Direct virtual adapter
+$script:DhcpRun     = $null      # runspace for router mode
+$script:DhcpHandle  = $null
+$script:ResvCache   = $null      # reservations loaded from CSV
+$sync               = [hashtable]::Synchronized(@{})
+$sync.Log           = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
+$sync.Leases        = [hashtable]::Synchronized(@{})
+$sync.Reservations  = @{}
+$sync.Stop          = $false
+$sync.StopMonitor   = $false
+$sync.PingTarget    = $null
+$sync.PingHist      = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
+$script:MonitorRun  = $null
 $script:MonitorHandle = $null
-
-$ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
-$SettingsFile = Join-Path $ScriptDir 'hotspot-settings.json'
-$ResvFile     = Join-Path $ScriptDir 'reservations.csv'
 
 $script:Subnet   = '192.168.137'
 $script:ServerIP = "$($script:Subnet).1"
@@ -98,26 +101,52 @@ function Load-Settings {
 
 function Save-Settings {
     param($ssid, $pass, $uplink, $routerMode, $vrmode, $autostart)
-    $o = [pscustomobject]@{ ssid = $ssid; pass = $pass; uplink = $uplink; routerMode = $routerMode; vrmode = $vrmode; autostart = $autostart }
-    $o | ConvertTo-Json | Set-Content -Path $SettingsFile -Encoding ASCII
+    try {
+        $o = [pscustomobject]@{ ssid = $ssid; pass = $pass; uplink = $uplink; routerMode = $routerMode; vrmode = $vrmode; autostart = $autostart }
+        $o | ConvertTo-Json | Set-Content -Path $SettingsFile -Encoding UTF8
+    } catch { Log "Could not save settings: $($_.Exception.Message)" }
+}
+
+function Norm-Mac([string]$m) {
+    return (($m -replace '[:-]', '') -replace '\s', '').ToLower()
 }
 
 function Load-Reservations {
     if (-not (Test-Path $ResvFile)) { return @() }
     try {
-        Import-Csv $ResvFile | ForEach-Object {
-            [pscustomobject]@{ mac = (Norm-Mac $_.mac); ip = $_.ip; name = $_.name }
-        }
+        $out = @(Import-Csv $ResvFile | ForEach-Object {
+            [pscustomobject]@{ mac = (Norm-Mac ([string]$_.mac)); ip = ([string]$_.ip); name = ([string]$_.name) }
+        })
+        return $out
     } catch { return @() }
 }
 
 function Save-Reservations([array]$list) {
-    if ($list.Count -eq 0) { Remove-Item $ResvFile -ErrorAction SilentlyContinue; return }
-    $list | Select-Object mac, ip, name | Export-Csv -Path $ResvFile -NoTypeInformation -Encoding ASCII
+    try {
+        if ($list.Count -eq 0) { Remove-Item $ResvFile -ErrorAction SilentlyContinue; return }
+        $list | Select-Object mac, ip, name | Export-Csv -Path $ResvFile -NoTypeInformation -Encoding UTF8
+    } catch { Log "Could not save reservations: $($_.Exception.Message)" }
 }
 
-function Norm-Mac([string]$m) {
-    return ($m -replace '[:-]', '' -replace '\s', '').ToLower()
+function Get-Reservations {
+    if ($null -eq $script:ResvCache) { $script:ResvCache = @(Load-Reservations) }
+    return $script:ResvCache
+}
+
+# single entry point for every reservation change: writes the CSV,
+# refreshes the GUI cache and updates the live DHCP reservation table
+# (so reservations apply immediately, no hotspot restart needed).
+function Set-Reservations([array]$list) {
+    # normalize MACs so the cache, the CSV and the DHCP table all use the
+    # same key format (v2.0.0 mixed formats, which broke matching)
+    $list = @($list | ForEach-Object {
+        [pscustomobject]@{ mac = (Norm-Mac ([string]$_.mac)); ip = ([string]$_.ip); name = ([string]$_.name) }
+    })
+    Save-Reservations $list
+    $script:ResvCache = $list
+    $h = @{}
+    foreach ($r in $list) { $h[$r.mac] = $r.ip }
+    $sync.Reservations = $h
 }
 
 function Get-UplinkAdapters {
@@ -144,25 +173,42 @@ function Disable-AdapterPowerSaving([string]$name) {
     } catch { Log "Could not disable power saving on '$name': $($_.Exception.Message)" }
 }
 
+# =====================================================================
+# VR mode (pause WLAN AutoConfig background scans = dropout fix)
+# =====================================================================
 function Enable-VRMode {
     $w = Get-PhysicalWifi
     if (-not $w) { Log 'VR mode: no physical Wi-Fi adapter found - scans not paused.'; return }
     netsh wlan set autoconfig enabled=no interface="$($w.Name)" 2>&1 | Out-Null
-    Set-Content -Path $VrFlagFile -Value $w.Name -Encoding ASCII
+    $flagWritten = $false
+    try { Set-Content -Path $VrFlagFile -Value $w.Name -Encoding ASCII -ErrorAction Stop; $flagWritten = $true }
+    catch {
+        # read-only install folder (e.g. extracted under Program Files) - fall back to %TEMP%
+        try { Set-Content -Path $VrFlagAlt -Value $w.Name -Encoding ASCII -ErrorAction Stop; $flagWritten = $true } catch { }
+    }
+    if (-not $flagWritten) { Log 'VR mode: could not write the crash-recovery flag (scans are still paused).' }
     Log "VR mode ON : background Wi-Fi scans paused on '$($w.Name)' (dropout fix)"
     Log '  Windows will not react to network changes until the hotspot stops.'
 }
 
+# Resumes scans if either flag file exists (script dir or %TEMP%
+# fallback). Returns $true when a paused state was actually found and
+# cleared - used both by normal stop and by crash recovery.
 function Disable-VRMode {
-    if (Test-Path $VrFlagFile) {
-        $wname = [string](Get-Content $VrFlagFile -ErrorAction SilentlyContinue | Select-Object -First 1)
-        if (-not $wname) { $w = Get-PhysicalWifi; if ($w) { $wname = $w.Name } }
-        if ($wname) {
-            netsh wlan set autoconfig enabled=yes interface="$wname" 2>&1 | Out-Null
-            Log "VR mode OFF: background Wi-Fi scans resumed on '$wname'"
+    $had = $false
+    foreach ($f in @($VrFlagFile, $VrFlagAlt)) {
+        if ($f -and (Test-Path $f)) {
+            $wname = [string](Get-Content $f -ErrorAction SilentlyContinue | Select-Object -First 1)
+            if (-not $wname) { $w = Get-PhysicalWifi; if ($w) { $wname = $w.Name } }
+            if ($wname) {
+                netsh wlan set autoconfig enabled=yes interface="$wname" 2>&1 | Out-Null
+                Log "VR mode OFF: background Wi-Fi scans resumed on '$wname'"
+            }
+            Remove-Item $f -ErrorAction SilentlyContinue
+            $had = $true
         }
-        Remove-Item $VrFlagFile -ErrorAction SilentlyContinue
     }
+    return $had
 }
 
 # ---------- ICS sharing (Shared mode) ----------
@@ -190,14 +236,23 @@ function Enable-IcsOnNames([string]$uplinkName, [string]$privateName) {
 
 # =====================================================================
 # built-in DHCP server source (runs in a background runspace)
+#
+# MAC normalization: reservation keys and packet MACs are both
+# normalized through MacKey (bare, lowercase) before comparison -
+# this is the fix for static IP reservations never matching (v1/v2
+# bug: CSV keys had no colons, packet MACs did).
+#
+# Test hooks (defaults are the production values):
+#   $sync.DhcpPort / $sync.ClientPort  - UDP ports (67 / 68)
+#   $sync.Broadcast                    - reply destination (255.255.255.255)
 # =====================================================================
 $DhcpSource = @'
 param($sync)
 $ErrorActionPreference = 'Continue'
 function Log($t) { $sync.Log.Add("$(Get-Date -Format 'HH:mm:ss')  [dhcp] $t") | Out-Null }
 function MacStr([byte[]]$b) { ($b[0..5] | ForEach-Object { $_.ToString('x2') }) -join ':' }
+function MacKey([string]$m) { (($m -replace '[:-]', '') -replace '\s', '').ToLower() }
 function IPBytes([string]$s) { ([System.Net.IPAddress]::Parse($s)).GetAddressBytes() }
-function StrBytes([string]$s) { [System.Text.Encoding]::ASCII.GetBytes($s) }
 
 function Read-Options([byte[]]$p) {
     $opts = @{}
@@ -208,14 +263,23 @@ function Read-Options([byte[]]$p) {
         if ($code -eq 255) { break }
         $len = $p[$i+1]
         $val = @()
-        if ($i + 2 + $len -le $p.Length) { $val = $p[($i+2)..($i+1+$len)] }
+        # guard both ends: a zero-length or truncated option must yield an
+        # empty array (the old slice with a descending range returned junk)
+        if ($len -gt 0 -and $i + 2 + $len -le $p.Length) { $val = @($p[($i+2)..($i+1+$len)]) }
         $opts[[int]$code] = $val
         $i += 2 + $len
     }
     return $opts
 }
 
-function New-Reply([byte[]]$req, [string]$yiaddr, [byte]$msgType, [string]$srvIp) {
+function OptStrIP($opts, [int]$code) {
+    if ($opts.ContainsKey($code) -and $opts[$code].Count -ge 4) {
+        return ('{0}.{1}.{2}.{3}' -f [int]$opts[$code][0], [int]$opts[$code][1], [int]$opts[$code][2], [int]$opts[$code][3])
+    }
+    return $null
+}
+
+function New-Reply([byte[]]$req, [string]$yiaddr, [int]$msgType, [string]$srvIp) {
     $r = New-Object byte[] 300
     $r[0] = 2; $r[1] = $req[1]; $r[2] = $req[2]; $r[3] = $req[3]
     [Array]::Copy($req, 4,  $r, 4,  4)    # xid
@@ -224,21 +288,23 @@ function New-Reply([byte[]]$req, [string]$yiaddr, [byte]$msgType, [string]$srvIp
     $y = IPBytes $yiaddr
     [Array]::Copy($y, 0, $r, 16, 4)       # yiaddr
     $m = IPBytes $srvIp
-    [Array]::Copy($m, 0, $r, 236, 0)      # noop guard
+    [Array]::Copy($m, 0, $r, 20, 4)       # siaddr
     $r[236] = 99; $r[237] = 130; $r[238] = 83; $r[239] = 99  # magic cookie
     $o = New-Object System.Collections.Generic.List[byte]
     # option 53: message type
     $o.Add(53); $o.Add(1); $o.Add($msgType)
     # option 54: server identifier
     $o.Add(54); $o.Add(4); foreach ($b in $m) { $o.Add($b) }
-    # option 51: lease time 12h
+    # option 51: lease time 12h, 58/59: renewal (T1) / rebind (T2)
     $o.Add(51); $o.Add(4); foreach ($b in [BitConverter]::GetBytes([uint32]43200)) { $o.Add($b) }
+    $o.Add(58); $o.Add(4); foreach ($b in [BitConverter]::GetBytes([uint32]21600)) { $o.Add($b) }
+    $o.Add(59); $o.Add(4); foreach ($b in [BitConverter]::GetBytes([uint32]37800)) { $o.Add($b) }
     # option 1: subnet mask
     $o.Add(1); $o.Add(4); foreach ($b in (IPBytes '255.255.255.0')) { $o.Add($b) }
     # option 3: router
     $o.Add(3); $o.Add(4); foreach ($b in $m) { $o.Add($b) }
     # option 6: DNS
-    $dns = (IPBytes '1.1.1.1') + (IPBytes '8.8.8.8')
+    $dns = @(IPBytes '1.1.1.1') + @(IPBytes '8.8.8.8')
     $o.Add(6); $o.Add($dns.Count); foreach ($b in $dns) { $o.Add($b) }
     $o.Add(255)
     $arr = $o.ToArray()
@@ -246,17 +312,34 @@ function New-Reply([byte[]]$req, [string]$yiaddr, [byte]$msgType, [string]$srvIp
     return $r
 }
 
-$ip      = $sync.ServerIP
-$poolStart = [int]$sync.PoolStart
-$poolEnd   = [int]$sync.PoolEnd
-$leases = @{}   # mac -> ip
+$ip        = [string]$sync.ServerIP
+$subnet    = [string]$sync.Subnet
+$poolStart = 100; if ($sync.PoolStart) { $poolStart = [int]$sync.PoolStart }
+$poolEnd   = 200; if ($sync.PoolEnd)   { $poolEnd   = [int]$sync.PoolEnd }
+$port      = 67;   if ($sync.DhcpPort)  { $port  = [int]$sync.DhcpPort }
+$cport     = 68;   if ($sync.ClientPort){ $cport = [int]$sync.ClientPort }
+$bcast     = '255.255.255.255'; if ($sync.Broadcast) { $bcast = [string]$sync.Broadcast }
 
-function Get-FreeIP($mac) {
-    if ($sync.Reservations -and $sync.Reservations.ContainsKey($mac)) { return $sync.Reservations[$mac] }
-    if ($leases.ContainsKey($mac)) { return $leases[$mac] }
-    $used = @($leases.Values) + @($sync.Reservations.Values)
+$leases = @{}     # mac (colon form) -> ip
+$offers = @{}     # mac (colon form) -> ip handed out in an OFFER, not yet ACKed
+$offerTime = @{}  # mac -> when the OFFER went out (offers expire after 60 s)
+
+function Get-FreeIP([string]$macKey, [string]$macDisp) {
+    # reservations are read LIVE from $sync.Reservations so the GUI can
+    # add/remove them while the hotspot runs
+    if ($sync.Reservations) {
+        foreach ($k in @($sync.Reservations.Keys)) {
+            if ((MacKey ([string]$k)) -eq $macKey) { return [string]$sync.Reservations[$k] }
+        }
+    }
+    if ($leases.ContainsKey($macDisp)) { return $leases[$macDisp] }
+    # an outstanding OFFER must be honored - otherwise the REQUEST for the
+    # address we just offered would count the offer as "used" and get NAKed
+    if ($offers.ContainsKey($macDisp)) { return $offers[$macDisp] }
+    $used = @($leases.Values) + @($offers.Values)
+    if ($sync.Reservations) { foreach ($v in @($sync.Reservations.Values)) { $used += [string]$v } }
     for ($n = $poolStart; $n -le $poolEnd; $n++) {
-        $cand = "$($sync.Subnet).$n"
+        $cand = "$subnet.$n"
         if ($used -notcontains $cand) { return $cand }
     }
     return $null
@@ -266,57 +349,82 @@ try {
     $udp = New-Object System.Net.Sockets.UdpClient
     $udp.ExclusiveAddressUse = $false
     $udp.Client.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::Socket, [System.Net.Sockets.SocketOptionName]::Broadcast, $true)
-    $udp.Client.Bind((New-Object System.Net.IPEndPoint ([System.Net.IPAddress]::Parse($ip), 67)))
+    $udp.Client.Bind((New-Object System.Net.IPEndPoint ([System.Net.IPAddress]::Parse($ip), $port)))
     $udp.Client.ReceiveTimeout = 700
-    Log "DHCP server listening on ${ip}:67"
+    Log "DHCP server listening on ${ip}:$port"
 } catch {
     Log "DHCP bind FAILED: $($_.Exception.Message)"
     return
 }
 
-$dst = New-Object System.Net.IPEndPoint ([System.Net.IPAddress]::Broadcast, 68)
+$dst = New-Object System.Net.IPEndPoint ([System.Net.IPAddress]::Parse($bcast), $cport)
 while (-not $sync.Stop) {
+    # expire stale offers so a DISCOVER that was never followed by a
+    # REQUEST cannot permanently eat a pool address
+    foreach ($k in @($offerTime.Keys)) {
+        if (((Get-Date) - $offerTime[$k]).TotalSeconds -gt 60) { $offers.Remove($k); $offerTime.Remove($k) }
+    }
     $ep = New-Object System.Net.IPEndPoint ([System.Net.IPAddress]::Any, 0)
     $req = $null
     try { $req = $udp.Receive([ref]$ep) } catch { continue }
     if ($null -eq $req -or $req.Length -lt 240) { continue }
-    $mac = MacStr $req[28..43]
+    # magic cookie must be present, otherwise this is not DHCP
+    if ($req[236] -ne 99 -or $req[237] -ne 130 -or $req[238] -ne 83 -or $req[239] -ne 99) { continue }
+    $macDisp = MacStr $req[28..43]
+    $macKey  = MacKey $macDisp
     $opts = Read-Options $req
     $msgType = 0
-    if ($opts.ContainsKey(53)) { $msgType = $opts[53][0] }
+    if ($opts.ContainsKey(53) -and $opts[53].Count -ge 1) { $msgType = [int]$opts[53][0] }
+
     if ($msgType -eq 1) {
         # DISCOVER -> OFFER
-        $offer = Get-FreeIP $mac
+        $offer = Get-FreeIP $macKey $macDisp
         if ($offer) {
-            $udp.Send((New-Reply $req $offer 2 $ip), 300, $dst) | Out-Null
-            Log "OFFER $offer to $mac"
-        }
+            $offers[$macDisp] = $offer
+            $offerTime[$macDisp] = Get-Date
+            try { $udp.Send((New-Reply $req $offer 2 $ip), 300, $dst) | Out-Null; Log "OFFER $offer to $macDisp" }
+            catch { Log "OFFER send failed: $($_.Exception.Message)" }
+        } else { Log "POOL FULL - no address for $macDisp" }
     }
     elseif ($msgType -eq 3) {
-        # REQUEST -> ACK
-        $wanted = $null
-        if ($opts.ContainsKey(50)) { $wanted = "$($opts[50][0]).$($opts[50][1]).$($opts[50][2]).$($opts[50][3])" }
-        elseif ($req[12] -ne 0) { $wanted = "$($req[12]).$($req[13]).$($req[14]).$($req[15])" }
-        $assigned = Get-FreeIP $mac
-        if ($assigned -and $wanted -eq $assigned) {
-            $leases[$mac] = $assigned
-            $sync.Leases[$mac] = $assigned
-            $udp.Send((New-Reply $req $assigned 5 $ip), 300, $dst) | Out-Null
-            $name = ''
-            if ($opts.ContainsKey(12)) { $name = [System.Text.Encoding]::ASCII.GetString($opts[12]) }
-            Log "ACK $assigned to $mac $name"
-        } else {
-            $r = New-Reply $req '0.0.0.0' 6 $ip
-            $udp.Send($r, 300, $dst) | Out-Null
-            Log "NAK $mac (wanted $wanted, assigned $assigned)"
+        # REQUEST -> ACK / NAK
+        # if the client is SELECTING a different server, this REQUEST is
+        # not ours - stay silent per RFC 2131
+        $srvSel = OptStrIP $opts 54
+        if ($srvSel -and $srvSel -ne $ip) { continue }
+        $wanted = OptStrIP $opts 50
+        if (-not $wanted -and ($req[12] -or $req[13] -or $req[14] -or $req[15])) {
+            $wanted = ('{0}.{1}.{2}.{3}' -f [int]$req[12], [int]$req[13], [int]$req[14], [int]$req[15])
         }
+        $assigned = Get-FreeIP $macKey $macDisp
+        if ($assigned -and $wanted -eq $assigned) {
+            $leases[$macDisp] = $assigned
+            $sync.Leases[$macDisp] = $assigned
+            $offers.Remove($macDisp)
+            $offerTime.Remove($macDisp)
+            try { $udp.Send((New-Reply $req $assigned 5 $ip), 300, $dst) | Out-Null } catch { }
+            $name = ''
+            if ($opts.ContainsKey(12) -and $opts[12].Count -gt 0) { $name = [System.Text.Encoding]::ASCII.GetString($opts[12]) }
+            Log "ACK $assigned to $macDisp $name"
+        } else {
+            try { $udp.Send((New-Reply $req '0.0.0.0' 6 $ip), 300, $dst) | Out-Null } catch { }
+            Log "NAK $macDisp (wanted $wanted, assigned $assigned)"
+        }
+    }
+    elseif ($msgType -eq 4) {
+        # DECLINE - the client found the address in use; drop it everywhere
+        $leases.Remove($macDisp)
+        $sync.Leases.Remove($macDisp)
+        $offers.Remove($macDisp)
+        $offerTime.Remove($macDisp)
+        Log "DECLINE $macDisp (address conflict reported - address returned to pool)"
     }
     elseif ($msgType -eq 7) {
         # RELEASE
-        if ($leases.ContainsKey($mac)) {
-            $sync.Leases.Remove($mac) | Out-Null
-            $leases.Remove($mac) | Out-Null
-            Log "RELEASE $mac"
+        if ($leases.ContainsKey($macDisp)) {
+            $sync.Leases.Remove($macDisp)
+            $leases.Remove($macDisp)
+            Log "RELEASE $macDisp"
         }
     }
 }
@@ -348,6 +456,19 @@ while (-not $sync.StopMonitor) {
 # =====================================================================
 # start / stop logic
 # =====================================================================
+function Stop-DhcpServer {
+    $sync.Stop = $true
+    if ($script:DhcpHandle) {
+        # give the runspace a moment to leave the blocking Receive call,
+        # so a restart can rebind port 67 immediately (v2.0.0 race)
+        $deadline = (Get-Date).AddSeconds(3)
+        while (-not $script:DhcpHandle.IsCompleted -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 100 }
+        try { $script:DhcpRun.Stop() } catch { }
+        try { $script:DhcpRun.Dispose() } catch { }
+        $script:DhcpRun = $null; $script:DhcpHandle = $null
+    }
+}
+
 function Start-Hotspot {
     param([string]$ssid, [string]$pass, [string]$uplinkName, [bool]$routerMode, [bool]$vrMode)
 
@@ -359,8 +480,10 @@ function Start-Hotspot {
         Log "Stop MyPublicWiFi (or any other hotspot app) first - one hotspot per radio."
         return $false
     }
-    if ($ssid.Length -lt 1 -or $pass.Length -lt 8) {
-        Log "SSID must be set and password must be at least 8 characters."
+    $ssid = $ssid.Trim()
+    if ($ssid.Length -lt 1) { Log 'SSID must be set.'; return $false }
+    if ($pass -notmatch '^[!-~]{8,63}$') {
+        Log 'Password must be 8-63 printable ASCII characters (WPA2 rule).'
         return $false
     }
 
@@ -437,16 +560,24 @@ function Start-Hotspot {
             Log "IP forwarding enabled on uplink + hotspot"
         } catch { Log "Forwarding setup: $($_.Exception.Message)" }
 
-        # start the DHCP server runspace
-        $sync.Stop = $false
-        $sync.Subnet = $script:Subnet
-        $sync.ServerIP = $script:ServerIP
+        # start the DHCP server runspace (reservations sync live afterwards)
+        Stop-DhcpServer
+        $sync.Leases.Clear()
+        $sync.Stop      = $false
+        $sync.Subnet    = $script:Subnet
+        $sync.ServerIP  = $script:ServerIP
         $sync.PoolStart = 100; $sync.PoolEnd = 200
-        $sync.Reservations = @{}
-        foreach ($r in (Load-Reservations)) { $sync.Reservations[$r.mac] = $r.ip }
+        $rv = Get-Reservations
+        $h = @{}
+        foreach ($r in $rv) { $h[(Norm-Mac $r.mac)] = $r.ip }
+        $sync.Reservations = $h
         $script:DhcpRun = [powershell]::Create().AddScript($DhcpSource).AddArgument($sync)
         $script:DhcpHandle = $script:DhcpRun.BeginInvoke()
-        Log "Built-in DHCP started (reservations from reservations.csv)"
+        Log "Built-in DHCP started with $($rv.Count) reservation(s)"
+        foreach ($r in $rv) { Log "  static: $($r.name)  $($r.mac)  -> $($r.ip)" }
+        if ($rv.Count -eq 0) {
+            Log '  (no reservations yet - add some under "Static IP reservations")'
+        }
     }
     # 3b. shared mode: ICS
     else {
@@ -458,30 +589,53 @@ function Start-Hotspot {
             Log "ICS could not be enabled (Windows ICS is limited on this system)."
             Log "Tip: try Router mode instead - it does not use ICS at all."
         }
+        if (@(Get-Reservations).Count -gt 0) {
+            Log 'Note: static IP reservations only take effect in Router mode.'
+        }
     }
     return $true
 }
 
 function Stop-Hotspot {
-    $sync.Stop = $true
-    if ($script:DhcpHandle) {
-        try { $script:DhcpRun.Stop(); $script:DhcpRun.Dispose() } catch { }
-        $script:DhcpRun = $null; $script:DhcpHandle = $null
-    }
+    Stop-DhcpServer
     try { Get-NetNat -Name VRHotspotNAT -ErrorAction SilentlyContinue | Remove-NetNat -Confirm:$false } catch { }
     try { Disable-AllIcs } catch { }
-    try { Disable-VRMode } catch { }
+    try { Disable-VRMode | Out-Null } catch { }
     if ($script:Pub) {
         try { $script:Pub.Stop() } catch { }
         Log "Hotspot stopped."
+        # wait for the virtual adapter to disappear so an immediate
+        # restart is not refused by the "one hotspot per radio" check
+        $deadline = (Get-Date).AddSeconds(5)
+        while ((Get-Date) -lt $deadline) {
+            if (-not (Get-WfdAdapter)) { break }
+            Start-Sleep -Milliseconds 250
+        }
     }
     $script:Pub = $null; $script:VAdapter = $null
     $sync.Leases.Clear()
 }
 
 # =====================================================================
-# GUI
+# GUI (skipped entirely in self-test mode)
 # =====================================================================
+if (-not $SelfTest) {
+
+# ---------- elevation ----------
+$id = [Security.Principal.WindowsIdentity]::GetCurrent()
+$pr = New-Object Security.Principal.WindowsPrincipal($id)
+if (-not $pr.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Add-Type -AssemblyName System.Windows.Forms
+    [System.Windows.Forms.MessageBox]::Show('Please run VR-Hotspot-Studio.bat as Administrator.', 'Elevation required') | Out-Null
+    exit 1
+}
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+
+[Windows.Devices.WiFiDirect.WiFiDirectAdvertisementPublisher,Windows.Devices.WiFiDirect,ContentType=WindowsRuntime] | Out-Null
+
 $dark   = [System.Drawing.Color]::FromArgb(32, 32, 36)
 $darker = [System.Drawing.Color]::FromArgb(43, 43, 48)
 $accent = [System.Drawing.Color]::FromArgb(0, 120, 215)
@@ -514,12 +668,25 @@ function New-Group([string]$text, [int]$x, [int]$y, [int]$w, [int]$h) {
 }
 
 $form = New-Object System.Windows.Forms.Form
-$form.Text = 'VR Hotspot Studio'
-$form.Size = New-Object System.Drawing.Size(580, 1032)
+$form.Text = "VR Hotspot Studio v$AppVersion"
 $form.StartPosition = 'CenterScreen'
 $form.BackColor = $dark
 $form.FormBorderStyle = 'FixedSingle'
 $form.MaximizeBox = $false
+# fit the window to the screen: on small displays the form scrolls
+# instead of cutting off the log and status bar (v2.0.0 was a fixed
+# 580x1032 which overflowed 768p/900p laptops)
+$wantH = 1032
+$formH = $wantH
+try {
+    $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    if ($wa.Height - 16 -lt $wantH) {
+        $formH = $wa.Height - 16
+        $form.AutoScroll = $true
+        $form.AutoScrollMinSize = New-Object System.Drawing.Size(564, 1000)
+    }
+} catch { }
+$form.Size = New-Object System.Drawing.Size(580, $formH)
 
 # ---------- title ----------
 $title = New-Object System.Windows.Forms.Label
@@ -684,8 +851,10 @@ function Make-Icon {
     $g.DrawArc($pen, 4, 16, 12, 12, 220, 100)
     $g.DrawArc($pen, 0, 12, 20, 20, 220, 100)
     $g.DrawArc($pen, -4, 8, 28, 28, 220, 100)
-    $g.Dispose()
-    return [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
+    $brush.Dispose(); $pen.Dispose(); $g.Dispose()
+    $icon = [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
+    $bmp.Dispose()
+    return $icon
 }
 $script:AppIcon = Make-Icon
 $form.Icon = $script:AppIcon
@@ -755,14 +924,23 @@ function Draw-Sparkline {
     $pbLat.Image = $bmp
 }
 
+function Clear-Sparkline {
+    if ($pbLat.Image) { $pbLat.Image.Dispose(); $pbLat.Image = $null }
+    if ($lblPing) { $lblPing.Text = 'Latency: hotspot not running.' }
+}
+
 # =====================================================================
 # GUI behavior
 # =====================================================================
 function Refresh-ResvList {
     $lvResv.Items.Clear()
-    foreach ($r in (Load-Reservations)) {
+    foreach ($r in (Get-Reservations)) {
         $item = New-Object System.Windows.Forms.ListViewItem($r.name)
-        [void]$item.SubItems.Add($r.mac)
+        $dispMac = $r.mac
+        if ($dispMac -match '^[0-9a-f]{12}$') {
+            $dispMac = $dispMac -replace '(..)(..)(..)(..)(..)(..)', '$1:$2:$3:$4:$5:$6'
+        }
+        [void]$item.SubItems.Add($dispMac)
         [void]$item.SubItems.Add($r.ip)
         $lvResv.Items.Add($item) | Out-Null
     }
@@ -779,6 +957,7 @@ function Refresh-Uplinks {
 $script:Running = $false
 
 function Invoke-StartHotspot {
+    if ($script:Running) { Log 'Hotspot is already running.'; return }
     $btnStart.Enabled = $false
     try {
         $uplink = $cbUp.SelectedItem
@@ -799,6 +978,7 @@ function Invoke-StopHotspot {
     $script:Running = $false
     $status.Text = 'Status: idle'
     $status.ForeColor = $gray
+    Clear-Sparkline
     try { $notifyIcon.ShowBalloonTip(2000, 'Hotspot stopped', 'Wi-Fi scans resumed.', [System.Windows.Forms.ToolTipIcon]::Info) } catch { }
 }
 
@@ -814,7 +994,7 @@ $btnCopy.Add_Click({
 
 $btnResAdd.Add_Click({
     $f = New-Object System.Windows.Forms.Form
-    $f.Text = 'Add reservation'; $f.Size = New-Object System.Drawing.Size(340, 268)
+    $f.Text = 'Add reservation'; $f.Size = New-Object System.Drawing.Size(340, 300)
     $f.StartPosition = 'CenterParent'; $f.BackColor = $dark; $f.FormBorderStyle = 'FixedDialog'
     $l0 = New-Label 'Pick a connected device (fills the fields)' 12 12 300; $f.Controls.Add($l0)
     $cbPick = New-Object System.Windows.Forms.ComboBox
@@ -826,7 +1006,7 @@ $btnResAdd.Add_Click({
         $parts = ($cbPick.Text -split '\s{2,}')
         if ($parts.Count -ge 3) {
             $t2.Text = $parts[2]
-            if ($parts[0] -ne 'client' -and $parts[0] -notmatch '^[0-9a-f:]{12,17}$') { $t1.Text = $parts[0] }
+            if ($parts[0] -ne 'client' -and ($parts[0] -replace '[:-]', '') -notmatch '^[0-9a-fA-F]{12}$') { $t1.Text = $parts[0] }
             if ($t3.Text -eq '192.168.137.50') { $t3.Text = $parts[1] }
         }
     })
@@ -838,19 +1018,34 @@ $btnResAdd.Add_Click({
     $l3 = New-Label 'Static IP' 12 162 100;   $f.Controls.Add($l3)
     $t3 = New-Box 12 182 160;                 $f.Controls.Add($t3)
     $t3.Text = '192.168.137.50'
+    $lErr = New-Label '' 12 212 300
+    $lErr.ForeColor = $red
+    $f.Controls.Add($lErr)
     $ok = New-Object System.Windows.Forms.Button
-    $ok.Text = 'Save'; $ok.Location = New-Object System.Drawing.Point(236, 180)
+    $ok.Text = 'Save'; $ok.Location = New-Object System.Drawing.Point(236, 240)
     $ok.Size = New-Object System.Drawing.Size(76, 28); $ok.FlatStyle = 'Flat'
     $ok.BackColor = $accent; $ok.ForeColor = $white
     $ok.Add_Click({
-        if ($t1.Text -and $t2.Text -and $t3.Text -match '^\d+\.\d+\.\d+\.\d+$') {
-            $list = @(Load-Reservations | Where-Object { $_.mac -ne (Norm-Mac $t2.Text) })
-            $list += [pscustomobject]@{ mac = (Norm-Mac $t2.Text); ip = $t3.Text; name = $t1.Text }
-            Save-Reservations $list
-            Refresh-ResvList
-            Log "Reservation saved: $($t1.Text) = $($t3.Text)"
-            $f.Close()
+        $lErr.Text = ''
+        $macN = Norm-Mac $t2.Text
+        $ipObj = $null
+        $ipOk = [System.Net.IPAddress]::TryParse($t3.Text.Trim(), [ref]$ipObj)
+        if (-not $macN -or $macN -notmatch '^[0-9a-f]{12}$') { $lErr.Text = 'MAC address does not look valid.'; return }
+        if (-not $ipOk) { $lErr.Text = 'Static IP is not a valid IP address.'; return }
+        if ($t3.Text.Trim() -notlike "$($script:Subnet).*") { $lErr.Text = "IP must be in $($script:Subnet).x (same subnet as the hotspot)."; return }
+        $list = @(Get-Reservations | Where-Object { $_.mac -ne $macN })
+        $clash = @($list | Where-Object { $_.ip -eq $t3.Text.Trim() })
+        if ($clash.Count -gt 0) { $lErr.Text = "IP $($t3.Text.Trim()) is already reserved for $($clash[0].name)."; return }
+        $nm = $t1.Text.Trim()
+        if (-not $nm) { $nm = 'device' }
+        $list += [pscustomobject]@{ mac = $macN; ip = $t3.Text.Trim(); name = $nm }
+        Set-Reservations $list
+        Refresh-ResvList
+        Log "Reservation saved: $nm = $($t3.Text.Trim())"
+        if ($script:Running -and $cbRouter.Checked) {
+            Log '  Applies immediately - reconnect the device (Wi-Fi off/on) to pick it up.'
         }
+        $f.Close()
     })
     $f.Controls.Add($ok)
     [void]$f.ShowDialog()
@@ -859,8 +1054,8 @@ $btnResAdd.Add_Click({
 $btnResDel.Add_Click({
     if ($lvResv.SelectedItems.Count -eq 0) { return }
     $mac = $lvResv.SelectedItems[0].SubItems[1].Text
-    $list = @(Load-Reservations | Where-Object { $_.mac -ne $mac })
-    Save-Reservations $list
+    $list = @(Get-Reservations | Where-Object { $_.mac -ne (Norm-Mac $mac) })
+    Set-Reservations $list
     Refresh-ResvList
     Log "Reservation removed: $mac"
 })
@@ -885,19 +1080,22 @@ $timer.Add_Tick({
         $st = [string]$script:Pub.Status
         if ($st -eq 'Aborted' -or $st -eq 'Stopped') {
             Log "Publisher state: $st - hotspot lost."
+            Stop-Hotspot
             $script:Running = $false
             $status.Text = 'Status: LOST (restart the hotspot)'
             $status.ForeColor = $red
+            $sync.PingTarget = $null
+            Clear-Sparkline
             return
         }
     }
     # clients
     $lvClients.Items.Clear()
+    $resv = Get-Reservations
     if ($cbRouter.Checked -and $sync.Leases.Count -gt 0) {
-        $resv = Load-Reservations
         foreach ($mac in @($sync.Leases.Keys)) {
             $ip = $sync.Leases[$mac]
-            $name = ($resv | Where-Object { $_.mac -eq $mac }).name
+            $name = ($resv | Where-Object { (Norm-Mac $_.mac) -eq (Norm-Mac $mac) } | Select-Object -First 1).name
             if (-not $name) { $name = $mac }
             $item = New-Object System.Windows.Forms.ListViewItem($name)
             [void]$item.SubItems.Add($ip)
@@ -909,11 +1107,10 @@ $timer.Add_Tick({
         try {
             $nb = Get-NetNeighbor -InterfaceIndex $script:VAdapter.InterfaceIndex -ErrorAction SilentlyContinue |
                   Where-Object { $_.State -in @('Reachable', 'Probe', 'Stale', 'Delay') -and $_.IPAddress -like "$($script:Subnet).*" }
-            $resv = Load-Reservations
             foreach ($n in $nb) {
                 $mac = $n.LinkLayerAddress
                 if (-not $mac) { continue }
-                $nm = ($resv | Where-Object { (Norm-Mac $_.mac) -eq (Norm-Mac $mac) }).name
+                $nm = ($resv | Where-Object { (Norm-Mac $_.mac) -eq (Norm-Mac $mac) } | Select-Object -First 1).name
                 if (-not $nm) { $nm = 'client' }
                 $item = New-Object System.Windows.Forms.ListViewItem($nm)
                 [void]$item.SubItems.Add($n.IPAddress)
@@ -936,7 +1133,7 @@ $form.Add_FormClosing({
         try { $script:MonitorRun.Stop(); $script:MonitorRun.Dispose() } catch { }
         $script:MonitorRun = $null; $script:MonitorHandle = $null
     }
-    try { Disable-VRMode } catch { }
+    try { Disable-VRMode | Out-Null } catch { }
     $timer.Stop()
     $notifyIcon.Visible = $false
     try { $notifyIcon.Dispose() } catch { }
@@ -945,8 +1142,8 @@ $form.Add_FormClosing({
 # ---------- init ----------
 $cfg = Load-Settings
 if ($cfg) {
-    $tSsid.Text = $cfg.ssid
-    $tPass.Text = $cfg.pass
+    $tSsid.Text = [string]$cfg.ssid
+    $tPass.Text = [string]$cfg.pass
     $cbRouter.Checked = [bool]$cfg.routerMode
     if ($null -ne $cfg.vrmode) { $cbVR.Checked = [bool]$cfg.vrmode } else { $cbVR.Checked = $true }
     $cbAuto.Checked = [bool]$cfg.autostart
@@ -961,8 +1158,7 @@ Refresh-Uplinks
 Refresh-ResvList
 
 # crash recovery: if the app died while VR mode had scans paused, resume them
-if (Test-Path $VrFlagFile) {
-    Disable-VRMode
+if (Disable-VRMode) {
     Log 'Crash recovery: Wi-Fi scans had been left paused - resumed now.'
 }
 
@@ -970,7 +1166,8 @@ if (Test-Path $VrFlagFile) {
 $script:MonitorRun = [powershell]::Create().AddScript($MonitorSource).AddArgument($sync)
 $script:MonitorHandle = $script:MonitorRun.BeginInvoke()
 
-Log 'Welcome. This hotspot uses Wi-Fi Direct (wlansvc), not the broken'
+Log "Welcome to VR Hotspot Studio v$AppVersion."
+Log 'This hotspot uses Wi-Fi Direct (wlansvc), not the broken'
 Log 'Windows tethering stack - it works even though Settings cannot.'
 Log 'One hotspot per radio: stop MyPublicWiFi before starting this.'
 if ($cfg -and $cfg.uplink -and $cbUp.Items.Contains($cfg.uplink)) { $cbUp.SelectedItem = $cfg.uplink }
@@ -984,3 +1181,5 @@ $form.Add_Shown({
 
 $timer.Start()
 [void]$form.ShowDialog()
+
+}   # end if (-not $SelfTest)
