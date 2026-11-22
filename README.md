@@ -163,16 +163,42 @@ most common items:
   Fully exit MyPublicWiFi / turn the Windows toggle off, try again.
 - **Clients connect, no internet** - wrong uplink selected, or the
   SharedAccess service stopped; details in the doc.
-- **The app will not start / PowerShell asks to "supply values"** - not
-  possible since v2.4.0: the launcher runs PowerShell with
-  `-NonInteractive`, and any startup crash lands in `studio-crash.log`
-  (a script that fails to even parse exits before a log can be written -
-  the console shows that error instead).
+- **The app will not start / PowerShell asks to "supply values"** -
+  that was a real bug through v2.4.0, fixed in v2.5.0: a layout helper
+  named `SC()` was silently shadowed by the built-in `sc` alias of
+  `Set-Content` (in PowerShell, aliases outrank functions). If the app
+  ever fails to start again, the launcher runs `-NonInteractive` and
+  writes the exact error to `studio-crash.log` (a script that fails to
+  even parse exits before a log can be written - the console shows
+  that error instead).
 - **A 2.4 GHz-only device can't see the hotspot** - you're on a 5 GHz
   uplink; the band follows the uplink (see above).
 
 ## Version history
 
+- **v2.5.0** - the real startup fix (found via the v2.4.0 crash log).
+  v2.3.0's DPI rework had added a layout helper named `SC()`; in
+  PowerShell **aliases outrank functions**, and `sc` is the built-in
+  alias of `Set-Content` - so every layout call was really
+  "Set-Content <number>" waiting for its mandatory `-Value` parameter.
+  That single name collision produced the "Supply values for the
+  following parameters" freeze on v2.3.0 and, under v2.4.0's
+  `-NonInteractive`, the "missing mandatory parameters: Value" crash
+  recorded in `studio-crash.log` before the window could open - the
+  GUI had not successfully started once since v2.3.0 shipped. The
+  helper is now `Scale-Px`, and the app deletes the dangerous built-in
+  aliases at startup so no function it defines can ever be shadowed
+  again. Everything v2.3.0/v2.4.0 shipped (custom subnet, bandwidth
+  strip, Track dropdown, DPI-scaled layout, taskbar minimize) becomes
+  visible for the first time.
+  Also hardened after a two-agent review: the log view no longer yanks
+  scrolled-up readers to the bottom every second (wheel/arrow scrolling
+  suspends following; End or a click at the bottom resumes it),
+  refusing the exit prompt no longer leaves a pending auto-close, a
+  dead DHCP server in Router mode now warns on the status bar instead
+  of silently leaving clients without addresses, the log trim is safe
+  under concurrent writers, and the Track dropdown is never rebuilt
+  while it is open.
 - **v2.4.0** - startup robustness and two bug fixes: the launcher now
   runs PowerShell with `-NonInteractive` (no more freezing on a
   "Supply values for the following parameters" prompt, whatever its

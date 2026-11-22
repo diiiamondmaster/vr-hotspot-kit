@@ -1,6 +1,6 @@
 <#
 =====================================================================
- VR-Hotspot-Studio.ps1  v2.4.0
+ VR-Hotspot-Studio.ps1  v2.5.0
  A standalone Wi-Fi hotspot app that does NOT depend on the Windows
  Mobile Hotspot (icssvc/tethering) stack at all.
 
@@ -23,6 +23,33 @@
      subnet is YOUR choice now: any private /24 (10.x, 172.16-31.x,
      192.168.x) via the "Hotspot IP" box; a start-time check refuses
      subnets that collide with the uplink.
+
+v2.5.0:
+   - The startup freeze, fixed at the root (diagnosed from
+     studio-crash.log, line 1914): the v2.3.0 DPI rework added a
+     scale helper named SC() - but in PowerShell ALIASES outrank
+     FUNCTIONS, and `sc` is the built-in alias of Set-Content. Every
+     layout call "SC <number>" was really "Set-Content <number>"
+     waiting for its mandatory -Value parameter: the "Supply values
+     for the following parameters" loop on v2.3.0, and - once the
+     v2.4.0 launcher added -NonInteractive - the fast "missing
+     mandatory parameters: Value" crash before the window could
+     open. The helper is now Scale-Px(); the GUI builds again, which
+     also un-hides everything v2.3.0/v2.4.0 shipped (any-subnet
+     Router mode, the bandwidth strip, the Track dropdown, the
+     DPI-scaled layout).
+   - The whole bug class is dead: the script deletes the built-in
+     aliases that can shadow short function names (sc, ac, si, sp,
+     sal, sv, clv, nv, rp) right after startup, so even a future
+     name collision resolves to the function, never to the alias.
+   - Hardened after a two-agent review: the log view no longer yanks
+     scrolled-up readers back to the bottom every second (following is
+     suspended by wheel/arrow scrolling and re-armed by End or a click
+     at the bottom), refusing the exit prompt no longer leaves a
+     pending auto-close, the log trim cannot throw under concurrent
+     writers, a dead DHCP server (Router mode) now warns on the status
+     bar instead of silently leaving clients without addresses, and
+     the Track dropdown is never rebuilt while it is open.
 
 v2.4.0:
    - Launcher hardening (fixes the "trouble starting" report):
@@ -97,7 +124,20 @@ v2.3.0:
 
 $ErrorActionPreference = 'Continue'
 $SelfTest   = ($env:VRHS_SELFTEST -eq '1')
-$AppVersion = '2.4.0'
+$AppVersion = '2.5.0'
+# v2.5.0 - alias guard (see the changelog at the top): `sc` is the
+# built-in alias of Set-Content and ALIASES OUTRANK FUNCTIONS in
+# command resolution, which is how the SC() helper got captured. The
+# helper is now Scale-Px; these removals make sure no built-in alias
+# can ever shadow a function this script defines. Cmdlets stay
+# reachable by their full names; removing an alias affects nothing
+# else in the process.
+foreach ($a in @('sc','ac','si','sp','sal','sv','clv','nv','rp')) {
+    # built-ins can be ReadOnly+AllScope: downgrade the options first,
+    # then remove - both steps are non-fatal by design
+    Set-Alias -Name $a -Value Set-Content -Option None -Scope Global -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path "Alias:$a" -Force -ErrorAction SilentlyContinue
+}
 
 # NetAdapter cmdlets are missing on some stripped images - detect once
 # so the app can degrade with a clear message instead of dying at load
@@ -173,7 +213,9 @@ $script:ServerIP = "$($script:Subnet).1"
 function Log([string]$t) {
     $stamp = Get-Date -Format 'HH:mm:ss'
     $sync.Log.Add("$stamp  $t") | Out-Null
-    if ($sync.Log.Count -gt 300) { $sync.Log.RemoveRange(0, 100) }
+    # check+trim is not atomic across the three writers - a concurrent
+    # trim can leave fewer than 100 lines; losing one trim cycle is fine
+    if ($sync.Log.Count -gt 300) { try { $sync.Log.RemoveRange(0, 100) } catch { } }
 }
 
 # Last-resort crash recorder (v2.4.0): an unhandled error in the GUI
@@ -1363,6 +1405,7 @@ function Start-Hotspot {
         $sync.Reservations = $h
         $script:DhcpRun = [powershell]::Create().AddScript($DhcpSource).AddArgument($sync)
         $script:DhcpHandle = $script:DhcpRun.BeginInvoke()
+        $script:DhcpDeadLogged = $false
         Enable-DhcpFirewallRule
         Log "Built-in DHCP started with $($rvOk.Count) reservation(s)"
         foreach ($r in $rvOk) { Log "  static: $($r.name)  $($r.mac)  -> $($r.ip)" }
@@ -1741,7 +1784,7 @@ if (-not $script:Singleton.WaitOne(0)) {
 # v2.2.0 placed every control at hard-coded 96-DPI pixels: on displays
 # with 125-150% scaling (or an increased Windows text size) labels
 # drifted onto the text boxes. The process now opts into DPI awareness
-# and every coordinate, size and font below goes through SC(), so the
+# and every coordinate, size and font below goes through Scale-Px(), so the
 # window stays crisp and correctly proportioned at any scale. Labels
 # also sit above their input fields now, so even a wider system font
 # cannot collide with an input box.
@@ -1756,7 +1799,11 @@ try {
     $g0.Dispose()
 } catch { $script:Scale = 1.0 }
 if ($script:Scale -lt 0.5 -or $script:Scale -gt 4.0) { $script:Scale = 1.0 }
-function SC([double]$v) { [int][Math]::Round($v * $script:Scale) }
+# NOTE: keep this name LONG. `sc` is the built-in alias of
+# Set-Content and ALIASES OUTRANK FUNCTIONS in command resolution -
+# the v2.3.0 helper named SC() never executed once because of that
+# (fixed in v2.5.0; see the alias guard near the top of the file).
+function Scale-Px([double]$v) { [int][Math]::Round($v * $script:Scale) }
 
 # ---------- palette + typography (dark "VR console" look) ----------
 $BgForm   = [System.Drawing.Color]::FromArgb(18, 21, 28)      # deep slate
@@ -1819,13 +1866,13 @@ public class VRhsDarkRenderer : ToolStripProfessionalRenderer {
 } catch { $VRhsDarkMenu = $false }
 
 # ---------- control factories ----------
-# All coordinates are 96-DPI design values; SC() scales them to the
+# All coordinates are 96-DPI design values; Scale-Px() scales them to the
 # real display DPI so nothing overlaps on scaled screens.
 function New-Label([string]$text, [int]$x, [int]$y, [int]$w, $col) {
     $l = New-Object System.Windows.Forms.Label
     $l.Text = $text
-    $l.Location = [System.Drawing.Point]::new((SC $x), (SC $y))
-    $l.Size = [System.Drawing.Size]::new((SC $w), (SC 15))
+    $l.Location = [System.Drawing.Point]::new((Scale-Px $x), (Scale-Px $y))
+    $l.Size = [System.Drawing.Size]::new((Scale-Px $w), (Scale-Px 15))
     $l.ForeColor = $col; $l.Font = $FontBody; $l.BackColor = [System.Drawing.Color]::Transparent
     $l.AutoEllipsis = $true
     return $l
@@ -1833,8 +1880,8 @@ function New-Label([string]$text, [int]$x, [int]$y, [int]$w, $col) {
 
 function New-Box([int]$x, [int]$y, [int]$w) {
     $t = New-Object System.Windows.Forms.TextBox
-    $t.Location = [System.Drawing.Point]::new((SC $x), (SC $y))
-    $t.Size = [System.Drawing.Size]::new((SC $w), (SC 24))
+    $t.Location = [System.Drawing.Point]::new((Scale-Px $x), (Scale-Px $y))
+    $t.Size = [System.Drawing.Size]::new((Scale-Px $w), (Scale-Px 24))
     $t.BackColor = $InputBg; $t.ForeColor = $White
     $t.BorderStyle = 'FixedSingle'; $t.Font = $FontBody
     return $t
@@ -1843,8 +1890,8 @@ function New-Box([int]$x, [int]$y, [int]$w) {
 function New-Chk([string]$text, [int]$x, [int]$y, [int]$w) {
     $c = New-Object System.Windows.Forms.CheckBox
     $c.Text = $text
-    $c.Location = [System.Drawing.Point]::new((SC $x), (SC $y))
-    $c.Size = [System.Drawing.Size]::new((SC $w), (SC 24))
+    $c.Location = [System.Drawing.Point]::new((Scale-Px $x), (Scale-Px $y))
+    $c.Size = [System.Drawing.Size]::new((Scale-Px $w), (Scale-Px 24))
     $c.ForeColor = $BodyText; $c.BackColor = $CardBg; $c.Font = $FontBody
     return $c
 }
@@ -1852,8 +1899,8 @@ function New-Chk([string]$text, [int]$x, [int]$y, [int]$w) {
 function New-Btn([string]$text, [int]$x, [int]$y, [int]$w, [int]$h, $bg, $fg, $hover) {
     $b = New-Object System.Windows.Forms.Button
     $b.Text = $text
-    $b.Location = [System.Drawing.Point]::new((SC $x), (SC $y))
-    $b.Size = [System.Drawing.Size]::new((SC $w), (SC $h))
+    $b.Location = [System.Drawing.Point]::new((Scale-Px $x), (Scale-Px $y))
+    $b.Size = [System.Drawing.Size]::new((Scale-Px $w), (Scale-Px $h))
     $b.FlatStyle = 'Flat'
     $b.FlatAppearance.BorderSize = 0
     $b.BackColor = $bg; $b.ForeColor = $fg
@@ -1875,14 +1922,14 @@ function Set-DoubleBuffered($c) {
 # card content starts at y 22 or lower)
 function New-Card([string]$title, [int]$x, [int]$y, [int]$w, [int]$h) {
     $p = New-Object System.Windows.Forms.Panel
-    $p.Location = [System.Drawing.Point]::new((SC $x), (SC $y))
-    $p.Size = [System.Drawing.Size]::new((SC $w), (SC $h))
+    $p.Location = [System.Drawing.Point]::new((Scale-Px $x), (Scale-Px $y))
+    $p.Size = [System.Drawing.Size]::new((Scale-Px $w), (Scale-Px $h))
     $p.BackColor = $CardBg
     Set-DoubleBuffered $p
     $t = New-Object System.Windows.Forms.Label
     $t.Text = $title.ToUpper([System.Globalization.CultureInfo]::InvariantCulture)
-    $t.Location = [System.Drawing.Point]::new((SC 14), (SC 8))
-    $t.Size = [System.Drawing.Size]::new((SC ($w - 28)), (SC 16))
+    $t.Location = [System.Drawing.Point]::new((Scale-Px 14), (Scale-Px 8))
+    $t.Size = [System.Drawing.Size]::new((Scale-Px ($w - 28)), (Scale-Px 16))
     $t.ForeColor = $Muted; $t.Font = $FontHdr
     $t.BackColor = [System.Drawing.Color]::Transparent
     $p.Controls.Add($t)
@@ -1911,24 +1958,24 @@ $wantW = 600
 # in scroll mode so the vertical scrollbar does not push a horizontal
 # one onto the cards.
 $wantH = 1042
-$formHpx = SC $wantH
+$formHpx = Scale-Px $wantH
 try {
     $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
     if (($wa.Height - 16) -lt $formHpx) {
         $formHpx = $wa.Height - 16
         $form.AutoScroll = $true
-        $form.AutoScrollMinSize = [System.Drawing.Size]::new((SC 568), (SC 1002))
+        $form.AutoScrollMinSize = [System.Drawing.Size]::new((Scale-Px 568), (Scale-Px 1002))
         $wantW = 620
     }
 } catch { }
-$form.Size = [System.Drawing.Size]::new((SC $wantW), $formHpx)
+$form.Size = [System.Drawing.Size]::new((Scale-Px $wantW), $formHpx)
 Set-DoubleBuffered $form
 
 # ---------- header band ----------
 $title = New-Object System.Windows.Forms.Label
 $title.Text = 'VR HOTSPOT STUDIO'
-$title.Location = [System.Drawing.Point]::new((SC 16), (SC 10))
-$title.Size = [System.Drawing.Size]::new((SC 400), (SC 30))
+$title.Location = [System.Drawing.Point]::new((Scale-Px 16), (Scale-Px 10))
+$title.Size = [System.Drawing.Size]::new((Scale-Px 400), (Scale-Px 30))
 $title.ForeColor = $White; $title.Font = $FontTitle
 $form.Controls.Add($title)
 $sub = New-Label 'standalone Wi-Fi Direct hotspot - no tethering stack' 16 42 424 $Muted
@@ -1938,8 +1985,8 @@ $form.Controls.Add($sub)
 $script:PillText  = 'IDLE'
 $script:PillColor = $Muted
 $script:PillPanel = New-Object System.Windows.Forms.Panel
-$script:PillPanel.Location = [System.Drawing.Point]::new((SC 448), (SC 14))
-$script:PillPanel.Size = [System.Drawing.Size]::new((SC 132), (SC 30))
+$script:PillPanel.Location = [System.Drawing.Point]::new((Scale-Px 448), (Scale-Px 14))
+$script:PillPanel.Size = [System.Drawing.Size]::new((Scale-Px 132), (Scale-Px 30))
 $script:PillPanel.Font = $FontBtn
 Set-DoubleBuffered $script:PillPanel
 $script:PillPanel.Add_Paint({
@@ -1997,8 +2044,8 @@ $gShare = New-Card 'Internet sharing' 16 192 568 158
 $form.Controls.Add($gShare)
 $gShare.Controls.Add((New-Label 'Uplink (adapter that has internet)' 16 30 260 $BodyText))
 $cbUp = New-Object System.Windows.Forms.ComboBox
-$cbUp.Location = [System.Drawing.Point]::new((SC 16), (SC 46))
-$cbUp.Size = [System.Drawing.Size]::new((SC 300), (SC 24))
+$cbUp.Location = [System.Drawing.Point]::new((Scale-Px 16), (Scale-Px 46))
+$cbUp.Size = [System.Drawing.Size]::new((Scale-Px 300), (Scale-Px 24))
 $cbUp.BackColor = $InputBg; $cbUp.ForeColor = $White
 $cbUp.FlatStyle = 'Flat'; $cbUp.Font = $FontBody
 $cbUp.DropDownStyle = 'DropDownList'
@@ -2020,8 +2067,8 @@ $gShare.Controls.Add($cbVR)
 $gClients = New-Card 'Connected devices' 16 356 568 156
 $form.Controls.Add($gClients)
 $lvClients = New-Object System.Windows.Forms.ListView
-$lvClients.Location = [System.Drawing.Point]::new((SC 14), (SC 26))
-$lvClients.Size = [System.Drawing.Size]::new((SC 540), (SC 88))
+$lvClients.Location = [System.Drawing.Point]::new((Scale-Px 14), (Scale-Px 26))
+$lvClients.Size = [System.Drawing.Size]::new((Scale-Px 540), (Scale-Px 88))
 $lvClients.View = 'Details'; $lvClients.FullRowSelect = $true
 $lvClients.HeaderStyle = 'Nonclickable'
 $lvClients.HideSelection = $false
@@ -2029,7 +2076,7 @@ $lvClients.BackColor = $InputBg; $lvClients.ForeColor = $White
 $lvClients.BorderStyle = 'FixedSingle'; $lvClients.Font = $FontBody
 Set-DoubleBuffered $lvClients
 foreach ($c in @(@('Device', 200), @('IP', 105), @('MAC', 150), @('Status', 85))) {
-    [void]$lvClients.Columns.Add($c[0], (SC $c[1]))
+    [void]$lvClients.Columns.Add($c[0], (Scale-Px $c[1]))
 }
 $gClients.Controls.Add($lvClients)
 $btnPin = New-Btn 'Pin static IP' 14 122 122 26 $AccentBtn $White $AccentHi
@@ -2040,8 +2087,8 @@ $gClients.Controls.Add((New-Label 'double-click pins its static IP - right-click
 $gResv = New-Card 'Static IP reservations (Router mode)' 16 518 568 156
 $form.Controls.Add($gResv)
 $lvResv = New-Object System.Windows.Forms.ListView
-$lvResv.Location = [System.Drawing.Point]::new((SC 14), (SC 26))
-$lvResv.Size = [System.Drawing.Size]::new((SC 404), (SC 88))
+$lvResv.Location = [System.Drawing.Point]::new((Scale-Px 14), (Scale-Px 26))
+$lvResv.Size = [System.Drawing.Size]::new((Scale-Px 404), (Scale-Px 88))
 $lvResv.View = 'Details'; $lvResv.FullRowSelect = $true
 $lvResv.HeaderStyle = 'Nonclickable'
 $lvResv.HideSelection = $false
@@ -2049,7 +2096,7 @@ $lvResv.BackColor = $InputBg; $lvResv.ForeColor = $White
 $lvResv.BorderStyle = 'FixedSingle'; $lvResv.Font = $FontBody
 Set-DoubleBuffered $lvResv
 foreach ($c in @(@('Name', 150), @('MAC', 150), @('IP', 104))) {
-    [void]$lvResv.Columns.Add($c[0], (SC $c[1]))
+    [void]$lvResv.Columns.Add($c[0], (Scale-Px $c[1]))
 }
 $gResv.Controls.Add($lvResv)
 $gResv.Controls.Add((New-Label 'reserved devices keep their address across reconnects' 14 126 404 $Muted))
@@ -2064,15 +2111,15 @@ $form.Controls.Add($gLat)
 $lblPing = New-Label 'Latency: waiting for a hotspot...' 14 25 330 $BodyText
 $gLat.Controls.Add($lblPing)
 $cbTrack = New-Object System.Windows.Forms.ComboBox
-$cbTrack.Location = [System.Drawing.Point]::new((SC 356), (SC 25))
-$cbTrack.Size = [System.Drawing.Size]::new((SC 198), (SC 24))
+$cbTrack.Location = [System.Drawing.Point]::new((Scale-Px 356), (Scale-Px 25))
+$cbTrack.Size = [System.Drawing.Size]::new((Scale-Px 198), (Scale-Px 24))
 $cbTrack.BackColor = $InputBg; $cbTrack.ForeColor = $White
 $cbTrack.FlatStyle = 'Flat'; $cbTrack.Font = $FontBody
 $cbTrack.DropDownStyle = 'DropDownList'
 $gLat.Controls.Add($cbTrack)
 $pbLat = New-Object System.Windows.Forms.PictureBox
-$pbLat.Location = [System.Drawing.Point]::new((SC 14), (SC 53))
-$pbLat.Size = [System.Drawing.Size]::new((SC 540), (SC 84))
+$pbLat.Location = [System.Drawing.Point]::new((Scale-Px 14), (Scale-Px 53))
+$pbLat.Size = [System.Drawing.Size]::new((Scale-Px 540), (Scale-Px 84))
 $pbLat.BackColor = $GraphBg
 $pbLat.BorderStyle = 'FixedSingle'
 $gLat.Controls.Add($pbLat)
@@ -2085,8 +2132,8 @@ $gLat.Controls.Add($lblBwRx)
 $gLog = New-Card 'Log' 16 858 568 112
 $form.Controls.Add($gLog)
 $tbLog = New-Object System.Windows.Forms.TextBox
-$tbLog.Location = [System.Drawing.Point]::new((SC 14), (SC 26))
-$tbLog.Size = [System.Drawing.Size]::new((SC 540), (SC 76))
+$tbLog.Location = [System.Drawing.Point]::new((Scale-Px 14), (Scale-Px 26))
+$tbLog.Size = [System.Drawing.Size]::new((Scale-Px 540), (Scale-Px 76))
 $tbLog.Multiline = $true; $tbLog.ScrollBars = 'Vertical'
 $tbLog.ReadOnly = $true
 $tbLog.BackColor = $GraphBg
@@ -2094,11 +2141,23 @@ $tbLog.ForeColor = $LogFg
 $tbLog.BorderStyle = 'FixedSingle'; $tbLog.Font = $FontMono
 $gLog.Controls.Add($tbLog)
 
+# tail-following state for the log view (consumed by the timer tick):
+# wheel or key scrolling away from the end suspends the 1 s view
+# updates; End / Ctrl+End / a click back at the bottom resume them.
+# A caret-only check could not see wheel scrolling (the caret stays
+# pinned at the end) and yanked scrolled-up readers down every second.
+$script:LogFollow = $true
+$tbLog.Add_MouseWheel({ $script:LogFollow = $false })
+$tbLog.Add_KeyDown({
+    if ($args[1].KeyCode -eq [System.Windows.Forms.Keys]::End) { $script:LogFollow = $true }
+    else { $script:LogFollow = $false }
+})
+
 # ---------- status strip ----------
 $status = New-Object System.Windows.Forms.Label
 $status.Text = 'Idle - hotspot not running.'
-$status.Location = [System.Drawing.Point]::new((SC 16), (SC 978))
-$status.Size = [System.Drawing.Size]::new((SC 568), (SC 18))
+$status.Location = [System.Drawing.Point]::new((Scale-Px 16), (Scale-Px 978))
+$status.Size = [System.Drawing.Size]::new((Scale-Px 568), (Scale-Px 18))
 $status.ForeColor = $BodyText; $status.Font = $FontBtn
 $status.AutoEllipsis = $true
 $form.Controls.Add($status)
@@ -2147,7 +2206,7 @@ $notifyIcon.Add_DoubleClick({ Show-MainForm })
 # =====================================================================
 $dlgForm = New-Object System.Windows.Forms.Form
 $dlgForm.Text = 'Pin a static IP'
-$dlgForm.Size = [System.Drawing.Size]::new((SC 376), (SC 348))
+$dlgForm.Size = [System.Drawing.Size]::new((Scale-Px 376), (Scale-Px 348))
 $dlgForm.StartPosition = 'CenterParent'
 $dlgForm.BackColor = $BgForm
 $dlgForm.FormBorderStyle = 'FixedDialog'
@@ -2158,8 +2217,8 @@ $dlgByText = @{}
 
 $dlgForm.Controls.Add((New-Label 'Copy details from a connected device:' 16 14 330 $BodyText))
 $dlgPick = New-Object System.Windows.Forms.ComboBox
-$dlgPick.Location = [System.Drawing.Point]::new((SC 16), (SC 34))
-$dlgPick.Size = [System.Drawing.Size]::new((SC 336), (SC 24))
+$dlgPick.Location = [System.Drawing.Point]::new((Scale-Px 16), (Scale-Px 34))
+$dlgPick.Size = [System.Drawing.Size]::new((Scale-Px 336), (Scale-Px 24))
 $dlgPick.BackColor = $InputBg; $dlgPick.ForeColor = $White
 $dlgPick.FlatStyle = 'Flat'; $dlgPick.Font = $FontBody
 $dlgPick.DropDownStyle = 'DropDownList'
@@ -2173,8 +2232,8 @@ $dlgForm.Controls.Add((New-Label 'Static IP (suggested: .50 - .99 range)' 16 180
 $dlgT3 = New-Box 16 200 160; $dlgForm.Controls.Add($dlgT3)
 $dlgErr = New-Object System.Windows.Forms.Label
 $dlgErr.Text = ''
-$dlgErr.Location = [System.Drawing.Point]::new((SC 16), (SC 230))
-$dlgErr.Size = [System.Drawing.Size]::new((SC 336), (SC 18))
+$dlgErr.Location = [System.Drawing.Point]::new((Scale-Px 16), (Scale-Px 230))
+$dlgErr.Size = [System.Drawing.Size]::new((Scale-Px 336), (Scale-Px 18))
 $dlgErr.ForeColor = $Red; $dlgErr.Font = $FontBody
 $dlgForm.Controls.Add($dlgErr)
 
@@ -2265,6 +2324,7 @@ $script:Busy         = $false
 $script:ClosePending = $false
 $script:SparkIdle    = $false
 $script:ScanDeadLogged = $false
+$script:DhcpDeadLogged = $false
 # graph target picker state
 $script:TrackByText  = @{}
 $script:TrackLastKey = $null    # $null (not '') so the FIRST tick always
@@ -2611,6 +2671,10 @@ function Update-TrackCombo {
     $devKey = ''
     foreach ($c in @($sync.Clients)) { $devKey += ('{0}|{1};' -f $c.macKey, $c.ip) }
     if ($devKey -eq $script:TrackLastKey) { return }
+    # never rebuild under an open dropdown - Items.Clear() would snap the
+    # user's list shut mid-choice; TrackLastKey is not updated yet, so
+    # the rebuild simply retries on the next tick
+    if ($cbTrack.DroppedDown) { return }
     $script:TrackLastKey = $devKey
     $script:TrackSync = $true
     try {
@@ -2661,10 +2725,14 @@ $timer.Add_Tick({
     try { $lastShown = [int]$tbLog.Tag } catch { }
     $logSnap = $sync.Log.ToArray()
     if ($lastShown -gt $logSnap.Count) { $lastShown = 0 }
-    # only follow the tail when the reader was already at the bottom -
-    # replacing the text while scrolled up would yank the view away
+    # follow the tail unless the reader scrolled away: the caret check
+    # alone cannot see wheel/scrollbar scrolling (the caret stays pinned
+    # at the end), so $script:LogFollow is driven by the log's own
+    # MouseWheel/KeyDown handlers above; a caret back at the end (a
+    # click or the End key) re-arms it
     $atEnd = ($tbLog.Text.Length -le 2) -or ($tbLog.SelectionStart -ge ($tbLog.Text.Length - 2))
-    if ($atEnd -and $logSnap.Count -gt $lastShown) {
+    if ($atEnd) { $script:LogFollow = $true }
+    if ($script:LogFollow -and $logSnap.Count -gt $lastShown) {
         $tbLog.Lines = [string[]]@($logSnap | Select-Object -Last 40)
         $tbLog.SelectionStart = $tbLog.Text.Length
         $tbLog.ScrollToCaret()
@@ -2692,6 +2760,16 @@ $timer.Add_Tick({
         $status.Text = 'WARNING: device tracker died - restart the hotspot.'
         $status.ForeColor = $Red
         return
+    }
+
+    # ---- DHCP server liveness (Router mode): clients silently getting
+    # no address is the worst failure mode - surface it on the spot ----
+    if ($script:Running -and $sync.RouterMode -and $script:DhcpHandle -and $script:DhcpHandle.IsCompleted -and -not $script:DhcpDeadLogged) {
+        $script:DhcpDeadLogged = $true
+        Log 'DHCP server stopped unexpectedly - new devices will not get an address.'
+        Log 'Restart the hotspot to restore address assignment.'
+        $status.Text = 'WARNING: DHCP server died - restart the hotspot.'
+        $status.ForeColor = $Red
     }
 
     # ---- publisher health ----
@@ -2726,7 +2804,7 @@ $timer.Add_Tick({
     $on = @($cl | Where-Object { $_.status -eq 'connected' }).Count
     $vrOn = 'OFF'
     if ((Test-Path $VrFlagFile) -or (Test-Path $VrFlagAlt)) { $vrOn = 'ON' }
-    if (-not $script:ScanDeadLogged) {
+    if (-not $script:ScanDeadLogged -and -not $script:DhcpDeadLogged) {
         $status.Text = ("RUNNING  |  SSID {0}  |  {1} device(s), {2} responsive  |  VR mode {3}" -f $tSsid.Text, $cl.Count, $on, $vrOn)
         $status.ForeColor = $BodyText
     }
@@ -2742,7 +2820,9 @@ $form.Add_FormClosing({
     }
     if ($script:Running) {
         $ans = [System.Windows.Forms.MessageBox]::Show($form, 'The hotspot is running. Stop it and exit VR Hotspot Studio?', 'Hotspot is live', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
-        if ($ans -ne [System.Windows.Forms.DialogResult]::Yes) { $e.Cancel = $true; return }
+        # refusing the exit must also drop a pending auto-close, or the
+        # next start/stop completion would close the app unasked
+        if ($ans -ne [System.Windows.Forms.DialogResult]::Yes) { $e.Cancel = $true; $script:ClosePending = $false; return }
     }
     # latch Busy and stop the timer FIRST so the DoEvents pumps inside
     # Stop-Hotspot cannot re-enter tick handlers or a second close

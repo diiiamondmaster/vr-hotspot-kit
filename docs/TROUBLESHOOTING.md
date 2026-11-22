@@ -8,11 +8,14 @@
 ## The app
 
 ### The app will not start / a console asks to "supply values for the following parameters"
-Older builds could end up frozen on that PowerShell prompt with the
-window never appearing. Since v2.4.0 the launcher runs PowerShell with
-`-NonInteractive`, so a prompting command fails immediately with a
-visible error instead of hanging - and any unhandled startup error is
-written to `studio-crash.log` (next to the script, or `%TEMP%`
+Fixed in v2.5.0: the culprit was a layout helper named `SC()` that the
+built-in `sc` alias (Set-Content) silently shadowed - in PowerShell,
+aliases outrank functions - so every scaled coordinate became a
+`Set-Content` waiting for its mandatory value. v2.3.0 and v2.4.0 could
+freeze or crash on it before the window ever opened. The launcher also
+runs PowerShell with `-NonInteractive` (a prompting command fails fast
+with a visible error instead of hanging), and any unhandled startup
+error is written to `studio-crash.log` (next to the script, or `%TEMP%`
 vrhs-crash.log if the folder is read-only) and shown in a message box.
 If it happens to you: close the console, re-run
 `VR-Hotspot-Studio.bat`, and if a window still does not appear, open
@@ -73,6 +76,12 @@ a bug.
 - **Router mode:** check the log for "NAT created". If NAT creation failed,
   run `Get-NetNat` in an elevated PowerShell and remove stale entries:
   `Get-NetNat | Remove-NetNat -Confirm:$false`, then restart the hotspot.
+- **Router mode on Windows 11 24H2+ / newer Insider builds:** the WinNAT
+  component (`New-NetNat`) has known regressions on those builds. If the
+  log shows "NAT creation failed" even after removing stale entries,
+  switch to **Shared mode** as a fallback (and the other way if the ICS
+  stack is what is broken on your machine - that is the situation this
+  app was built for).
 - If the PC itself lost internet while the hotspot runs, the uplink adapter
   dropped - reconnect it and stop/start the hotspot so ICS re-binds.
 
