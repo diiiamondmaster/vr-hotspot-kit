@@ -1,6 +1,6 @@
 <#
 =====================================================================
- VR-Hotspot-Studio.ps1  v2.2.0
+ VR-Hotspot-Studio.ps1  v2.3.0
  A standalone Wi-Fi hotspot app that does NOT depend on the Windows
  Mobile Hotspot (icssvc/tethering) stack at all.
 
@@ -19,7 +19,22 @@
    ROUTER MODE (advanced): the app itself runs NAT (New-NetNat) and
      a built-in DHCP server with per-MAC static IP reservations -
      ideal for printers that need a fixed address. Reservations can
-     be added or removed while the hotspot is running.
+     be added or removed while the hotspot is running. The hotspot
+     subnet is YOUR choice now: any private /24 (10.x, 172.16-31.x,
+     192.168.x) via the "Hotspot IP" box; a start-time check refuses
+     subnets that collide with the uplink.
+
+v2.3.0:
+   - Hotspot IP field: Router mode is no longer locked to
+     192.168.137.x - pick any private /24.
+   - "Latency + bandwidth" card: a visible Track dropdown chooses
+     which connected device the graph follows (the right-click menu
+     still works too), and a second strip under the latency graph
+     shows live hotspot throughput - to devices / from devices in
+     Mbps with session totals, from the adapter counters.
+   - DPI-aware rendering: the whole layout scales on 125-150%
+     displays, and labels sit above their input fields, so text no
+     longer overlaps the text boxes on scaled screens.
 
  CONNECTED DEVICES (v2.2.0 rework):
    A background tracker merges the ARP/neighbor table, DHCP leases
@@ -61,11 +76,14 @@
 
 $ErrorActionPreference = 'Continue'
 $SelfTest   = ($env:VRHS_SELFTEST -eq '1')
-$AppVersion = '2.2.0'
+$AppVersion = '2.3.0'
 
 # NetAdapter cmdlets are missing on some stripped images - detect once
 # so the app can degrade with a clear message instead of dying at load
 $script:HasNetAdapter = [bool](Get-Command -Name Get-NetAdapter -ErrorAction SilentlyContinue)
+# Router mode also needs the NetTCPIP cmdlets (Get-/New-NetIPAddress,
+# New-NetNat); Shared mode does not. Detected once for the same reason.
+$script:HasNetTcpIp = [bool](Get-Command -Name Get-NetIPAddress -ErrorAction SilentlyContinue)
 
 # =====================================================================
 # script location - MUST be resolved before anything that uses it
@@ -113,6 +131,18 @@ $sync.GraceRemove   = 0        # 0 = built-in default (45 s)
 $sync.Sim           = $false
 $sync.SimNeighbors  = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
 $sync.SimPing       = [hashtable]::Synchronized(@{})
+# bandwidth history (Mbps per cycle; -1 = no sample) + session totals,
+# sampled from the hotspot adapter counters by the client tracker
+$sync.BwHistR       = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
+$sync.BwHistT       = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
+$sync.BwOk          = $false     # true once a counter sample succeeded
+$sync.BwFail        = $false     # true when adapter counters are unavailable
+$sync.BwTotalR      = [long]0    # session total bytes, hotspot RX (from devices)
+$sync.BwTotalT      = [long]0    # session total bytes, hotspot TX (to devices)
+$sync.BwIfName      = ''         # adapter the tracker samples counters on
+$sync.BwIfIndex     = 0          # its interface index (hidden adapters
+                                 # are only reliably addressable by index)
+$sync.SimBw         = [hashtable]::Synchronized(@{})   # test hook: r / t Mbps
 
 $script:Subnet   = '192.168.137'
 $script:ServerIP = "$($script:Subnet).1"
@@ -134,9 +164,9 @@ function Load-Settings {
 }
 
 function Save-Settings {
-    param($ssid, $pass, $uplink, $routerMode, $vrmode, $autostart)
+    param($ssid, $pass, $uplink, $routerMode, $vrmode, $autostart, $serverIp)
     try {
-        $o = [pscustomobject]@{ ssid = $ssid; pass = $pass; uplink = $uplink; routerMode = $routerMode; vrmode = $vrmode; autostart = $autostart }
+        $o = [pscustomobject]@{ ssid = $ssid; pass = $pass; uplink = $uplink; routerMode = $routerMode; vrmode = $vrmode; autostart = $autostart; serverIp = $serverIp }
         $o | ConvertTo-Json | Set-Content -Path $SettingsFile -Encoding UTF8
     } catch { Log "Could not save settings: $($_.Exception.Message)" }
 }
@@ -218,14 +248,92 @@ function Resolve-DeviceName([string]$mac) {
 # next free static IP suggestion: .50 upward, skipping addresses that
 # are already reserved or currently in use by a connected device
 function Get-SuggestedIP {
-    $taken = @()
+    $sub = Get-ActiveSubnet
+    # never suggest the hotspot PC's own address - which is not
+    # necessarily .1 anymore now that the gateway IP is configurable
+    $gws = @("$sub.1")
+    if ($script:ServerIP -and ($script:ServerIP -like "$sub.*")) { $gws += $script:ServerIP }
+    if ($script:Running -and [string]$sync.ServerIP) { $gws += [string]$sync.ServerIP }
+    $taken = @($gws)
     foreach ($r in (Get-Reservations)) { $taken += $r.ip }
     foreach ($c in @($sync.Clients)) { $taken += $c.ip }
     for ($n = 50; $n -lt 100; $n++) {
-        $cand = "$($script:Subnet).$n"
+        $cand = "$sub.$n"
         if ($taken -notcontains $cand) { return $cand }
     }
-    return "$($script:Subnet).50"
+    return "$sub.50"
+}
+
+# Validate a candidate hotspot (gateway) IP. Returns the implied /24
+# subnet ("192.168.50" for 192.168.50.1) on success, $null on failure
+# and leaves a human-readable reason in $script:IpErr. Any private
+# range is accepted - the app is no longer locked to 192.168.137.x.
+function Test-ServerIP([string]$s) {
+    # strict dotted-quad form first: .NET's legacy parser happily accepts
+    # "10.1" (-> 10.0.0.1) and leading zeros, which would silently mean
+    # a different network than the user typed
+    $script:IpErr = ''
+    $script:IpCanonical = ''
+    $s = "$s".Trim()
+    if ($s -notmatch '^\d{1,3}(\.\d{1,3}){3}$') { $script:IpErr = 'Not a valid IPv4 address (example: 192.168.50.1)'; return $null }
+    $ipObj = $null
+    if (-not [System.Net.IPAddress]::TryParse($s, [ref]$ipObj)) { $script:IpErr = 'Not a valid IPv4 address'; return $null }
+    if ($ipObj.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) { $script:IpErr = 'IPv4 only (no IPv6)'; return $null }
+    $b = $ipObj.GetAddressBytes()
+    $priv = ($b[0] -eq 10) -or ($b[0] -eq 172 -and $b[1] -ge 16 -and $b[1] -le 31) -or ($b[0] -eq 192 -and $b[1] -eq 168)
+    if (-not $priv) { $script:IpErr = 'Use a private range (10 / 172.16-31 / 192.168)'; return $null }
+    if ($b[3] -eq 0 -or $b[3] -eq 255) { $script:IpErr = 'Last number cannot be 0 or 255'; return $null }
+    $script:IpCanonical = ('{0}.{1}.{2}.{3}' -f [int]$b[0], [int]$b[1], [int]$b[2], [int]$b[3])
+    return ('{0}.{1}.{2}' -f [int]$b[0], [int]$b[1], [int]$b[2])
+}
+
+# True when the two IPv4 prefixes overlap (either contains the other).
+# The hotspot is always a /24, but the uplink can be anything - a /16
+# uplink on 192.168.0.0 must block a 192.168.50.0/24 hotspot even though
+# no /24 string comparison would notice.
+function Test-SubnetOverlap([string]$netA, [int]$lenA, [string]$netB, [int]$lenB) {
+    try {
+        $a = [System.Net.IPAddress]::Parse($netA).GetAddressBytes()
+        $b = [System.Net.IPAddress]::Parse($netB).GetAddressBytes()
+    } catch { return $false }
+    if ($a.Count -ne 4 -or $b.Count -ne 4) { return $false }
+    if ($lenA -lt 0 -or $lenA -gt 32) { $lenA = 32 }
+    if ($lenB -lt 0 -or $lenB -gt 32) { $lenB = 32 }
+    $bits = [Math]::Min($lenA, $lenB)
+    $fullBytes = [int][Math]::Floor($bits / 8)
+    $rem = $bits % 8
+    for ($i = 0; $i -lt 4; $i++) {
+        if ($i -lt $fullBytes) {
+            if ($a[$i] -ne $b[$i]) { return $false }
+        }
+        elseif ($i -eq $fullBytes -and $rem -gt 0) {
+            $m = 256 - [int][Math]::Pow(2, (8 - $rem))
+            if (($a[$i] -band $m) -ne ($b[$i] -band $m)) { return $false }
+        }
+    }
+    return $true
+}
+
+# The subnet the RUNNING hotspot actually uses (Shared mode adopts the
+# ICS-assigned one at start); before/after a run this is the configured
+# one. Everything user-facing (suggestions, dialog validation) must use
+# THIS value, never the raw configured one, or the two diverge the
+# moment the Hotspot IP box is edited while running.
+function Get-ActiveSubnet {
+    if ($script:Running) {
+        $s = [string]$sync.Subnet
+        if ($s) { return $s }
+    }
+    return $script:Subnet
+}
+
+# Byte count -> compact human string ("812 MB", "2.18 GB")
+function Format-Bytes([double]$v) {
+    if ($v -lt 0) { return '?' }
+    if ($v -lt 1024) { return ('{0} B' -f [int]$v) }
+    if ($v -lt 1048576) { return ('{0:N1} KB' -f ($v / 1024)) }
+    if ($v -lt 1073741824) { return ('{0:N1} MB' -f ($v / 1048576)) }
+    return ('{0:N2} GB' -f ($v / 1073741824))
 }
 
 function Get-UplinkAdapters {
@@ -433,10 +541,26 @@ function Publish-Leases {
 
 function Get-FreeIP([string]$macKey, [string]$macDisp) {
     # reservations are read LIVE from $sync.Reservations so the GUI can
-    # add/remove them while the hotspot runs
+    # add/remove them while the hotspot runs. Two guards:
+    #  - only reservations INSIDE this server's subnet are honored (the
+    #    GUI keeps rows for other subnets around after a subnet change;
+    #    handing one out would silently break the client)
+    #  - if another device currently holds the reserved address, fall
+    #    through to the pool instead of ACKing a duplicate
     if ($sync.Reservations) {
         foreach ($k in @($sync.Reservations.Keys)) {
-            if ((MacKey ([string]$k)) -eq $macKey) { return [string]$sync.Reservations[$k] }
+            if ((MacKey ([string]$k)) -eq $macKey) {
+                $rip = [string]$sync.Reservations[$k]
+                if ($rip -like "$subnet.*") {
+                    $heldBy = $null
+                    foreach ($lk in @($leases.Keys)) {
+                        if ($lk -ne $macDisp -and [string]$leases[$lk] -eq $rip) { $heldBy = $lk; break }
+                    }
+                    if (-not $heldBy) { return $rip }
+                    Log "reservation $rip is currently held by $heldBy - using the pool for $macDisp"
+                }
+                break
+            }
         }
     }
     if ($leases.ContainsKey($macDisp)) { return $leases[$macDisp] }
@@ -628,6 +752,16 @@ $graceOn  = 12; if ($sync.GraceOnline) { $graceOn = [int]$sync.GraceOnline }
 $graceRm  = 45; if ($sync.GraceRemove) { $graceRm = [int]$sync.GraceRemove }
 $hasNb    = [bool](Get-Command -Name Get-NetNeighbor -ErrorAction SilentlyContinue)
 $fresh    = @('Reachable', 'Probe', 'Delay', 'Permanent')
+# bandwidth sampling state (hotspot adapter counters)
+$hasStat  = [bool](Get-Command -Name Get-NetAdapterStatistics -ErrorAction SilentlyContinue)
+$bwIf     = [string]$sync.BwIfName
+$bwIdx    = [int]$sync.BwIfIndex
+$prevNow  = Get-Date
+$prevR    = -1L; $prevT = -1L
+$baseR    = 0L;  $baseT = 0L
+$firstStat = $true
+$statFails = 0
+if (-not $hasStat) { $sync.BwFail = $true }
 
 if ($sim) { Log 'client tracking started (sim mode)' }
 else      { Log "client tracking started on interface $ifIndex" }
@@ -678,7 +812,8 @@ while (-not $sync.StopScan) {
         if (-not $k -or $k -notmatch '^[0-9a-f]{12}$') { continue }
         if ($k -match '^(ff|01005e|3333)') { continue }        # multicast/broadcast MACs
         $ip = [string]$r.ip
-        if (-not $ip -or $ip -eq "$subnet.1") { continue }      # our own address
+        # our own address: the classic .1 OR the configured gateway
+        if (-not $ip -or $ip -eq "$subnet.1" -or $ip -eq ([string]$sync.ServerIP)) { continue }
         $state = [string]$r.state
         if ($table.ContainsKey($k)) {
             $e = $table[$k]
@@ -741,6 +876,61 @@ while (-not $sync.StopScan) {
         }
     }
 
+    # ---- 4b. bandwidth sample (hotspot adapter counters) -----------
+    # Rates are Mbps over the real elapsed time; -1 marks "no sample".
+    # A counter wrap/reset (adapter recreated) just re-baselines the
+    # session totals and skips one rate sample.
+    $bwR = -1.0; $bwT = -1.0
+    if ($sim) {
+        if ($sync.SimBw.ContainsKey('r')) { $bwR = [double]$sync.SimBw['r'] }
+        if ($sync.SimBw.ContainsKey('t')) { $bwT = [double]$sync.SimBw['t'] }
+        if ($bwR -ge 0 -or $bwT -ge 0) { $sync.BwOk = $true }
+    }
+    elseif ($hasStat -and ($bwIdx -gt 0 -or $bwIf)) {
+        try {
+            # sample by interface INDEX with -IncludeHidden: the WFD
+            # virtual adapter is hidden, and its name contains a literal
+            # '*' which -Name would treat as a wildcard (multi-match ->
+            # array -> cast failure every cycle)
+            $stats = @()
+            if ($bwIdx -gt 0) {
+                $stats = @(Get-NetAdapterStatistics -InterfaceIndex $bwIdx -IncludeHidden -ErrorAction Stop)
+            }
+            else {
+                $stats = @(Get-NetAdapterStatistics -Name $bwIf -IncludeHidden -ErrorAction Stop |
+                           Where-Object { $_.Name -eq $bwIf })
+            }
+            if ($stats.Count -ne 1) { throw 'adapter statistics not found' }
+            $st = $stats[0]
+            $r = [long]$st.ReceivedBytes
+            $t = [long]$st.SentBytes
+            $dt = ($now - $prevNow).TotalSeconds
+            if ($dt -gt 0.2) {
+                if ($r -lt $prevR) { $baseR = $r }   # counter reset
+                if ($t -lt $prevT) { $baseT = $t }
+                if (-not $firstStat -and $r -ge $prevR -and $t -ge $prevT) {
+                    $bwR = (($r - $prevR) * 8.0) / ($dt * 1000000.0)
+                    $bwT = (($t - $prevT) * 8.0) / ($dt * 1000000.0)
+                }
+                if ($firstStat) { $baseR = $r; $baseT = $t; $firstStat = $false }
+                if ($bwR -ge 0 -or $bwT -ge 0) { $sync.BwOk = $true }
+                $sync.BwTotalR = [long][Math]::Max(0, ($r - $baseR))
+                $sync.BwTotalT = [long][Math]::Max(0, ($t - $baseT))
+                $statFails = 0
+                $sync.BwFail = $false
+            }
+            $prevR = $r; $prevT = $t
+            $prevNow = $now
+        } catch {
+            $statFails++
+            if ($statFails -ge 10) { $sync.BwFail = $true }
+        }
+    }
+    [void]$sync.BwHistR.Add($bwR)
+    [void]$sync.BwHistT.Add($bwT)
+    try { if ($sync.BwHistR.Count -gt 180) { $sync.BwHistR.RemoveRange(0, ($sync.BwHistR.Count - 180)) } } catch { }
+    try { if ($sync.BwHistT.Count -gt 180) { $sync.BwHistT.RemoveRange(0, ($sync.BwHistT.Count - 180)) } } catch { }
+
     # ---- 5. status + expiry ----------------------------------------
     $keep = @{}
     foreach ($k in @($table.Keys)) {
@@ -754,6 +944,13 @@ while (-not $sync.StopScan) {
         if ($ageSeen -gt $graceRm) {
             if ($e.lease -or $reserved) { $e.status = 'offline' }
             else { Log "client left: $($e.ip) $($e.macDisp)"; continue }
+        }
+        # offline rows are kept so leased/reserved devices show where
+        # they went - but not forever: after an hour of silence the row
+        # is dropped so the 32-slot keepalive budget cannot be starved
+        if ($e.status -eq 'offline' -and $ageSeen -gt 3600) {
+            Log "client row expired after 1 h offline: $($e.ip) $($e.macDisp)"
+            continue
         }
         $keep[$k] = $e
     }
@@ -796,6 +993,7 @@ while (-not $sync.StopScan) {
                     # switching graph targets: start a clean history so the
                     # window does not mix two different devices
                     $sync.PingHist.Clear()
+                    Log "graph target: following $($pick.ip) ($($pick.macDisp))"
                 }
                 $sync.PingTarget = $pick.ip
                 $sync.TargetMac  = $pick.macKey
@@ -841,6 +1039,12 @@ function Start-ClientScan {
     $sync.StopScan     = $false
     $sync.Clients      = @()
     $sync.PingHist.Clear()
+    $sync.BwHistR.Clear()
+    $sync.BwHistT.Clear()
+    $sync.BwOk    = $false
+    $sync.BwFail  = $false
+    $sync.BwTotalR = [long]0
+    $sync.BwTotalT = [long]0
     $sync.PingTarget   = $null
     $sync.TargetMac    = $null
     $sync.TargetName   = $null
@@ -870,6 +1074,8 @@ function Stop-ClientScan {
     # clear the published snapshot so the GUI does not keep showing
     # frozen 'connected' rows after the hotspot stops
     $sync.Clients = @()
+    $sync.BwHistR.Clear()
+    $sync.BwHistT.Clear()
 }
 
 # =====================================================================
@@ -936,6 +1142,37 @@ function Start-Hotspot {
         return $false
     }
 
+    # 0b. router mode: the chosen subnet must not collide with any live
+    # uplink subnet, or NAT/forwarding silently break (two interfaces
+    # inside one /24). Refuse with a clear message instead.
+    if ($routerMode) {
+        if (-not $script:HasNetTcpIp) {
+            Log 'Router mode needs the NetTCPIP cmdlets (Get-NetIPAddress / New-NetIPAddress),'
+            Log 'which this Windows image is missing. Use Shared mode (Windows ICS) instead.'
+            return $false
+        }
+        $clash = @()
+        if ($script:HasNetAdapter) {
+            foreach ($a in @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch 'Wi-Fi Direct|Hosted' })) {
+                $ips = @()
+                try { $ips = @(Get-NetIPAddress -InterfaceIndex $a.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue) } catch { }
+                foreach ($ip in $ips) {
+                    if ($ip.IPAddress -like '169.254.*') { continue }
+                    # prefix-aware: a /16 uplink must block any /24 inside
+                    # it, not just the identical /24
+                    $plen = 24
+                    try { if ($null -ne $ip.PrefixLength -and [int]$ip.PrefixLength -gt 0) { $plen = [int]$ip.PrefixLength } } catch { }
+                    if (Test-SubnetOverlap "$($script:Subnet).0" 24 ([string]$ip.IPAddress) $plen) { $clash += $a.Name }
+                }
+            }
+        }
+        if ($clash.Count -gt 0) {
+            Log "The hotspot subnet $($script:Subnet).0/24 overlaps the network on: $(($clash | Select-Object -Unique) -join ', ')"
+            Log 'Pick a different Hotspot IP in the Internet sharing card (e.g. 192.168.50.1) and start again.'
+            return $false
+        }
+    }
+
     # 1. create the Wi-Fi Direct publisher
     try {
         $script:Pub = New-Object Windows.Devices.WiFiDirect.WiFiDirectAdvertisementPublisher
@@ -997,17 +1234,47 @@ function Start-Hotspot {
     if ($script:VAdapter) { Disable-AdapterPowerSaving $script:VAdapter.Name }
     if ($vrMode) { Enable-VRMode }
 
+    # runtime subnet: Router mode uses the configured one; Shared mode
+    # adopts whatever Windows ICS actually assigned (detected below)
+    $runSub = $script:Subnet
+    $icsAddr = ''
+    $script:RouterIpOk = $false
+
     # 3a. router mode: own NAT + own DHCP with reservations
     if ($routerMode) {
         Disable-AllIcs
         try {
-            $existing = Get-NetIPAddress -InterfaceIndex $script:VAdapter.InterfaceIndex -ErrorAction SilentlyContinue |
-                        Where-Object { $_.IPAddress -like "$($script:Subnet).*" }
+            # drop leftover addresses from earlier sessions (e.g. an ICS
+            # 192.168.137.1) so only the chosen subnet lives on the adapter
+            $stale = @(Get-NetIPAddress -InterfaceIndex $script:VAdapter.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                       Where-Object { $_.IPAddress -notlike '169.254.*' -and $_.IPAddress -notlike "$($script:Subnet).*" })
+            foreach ($si in $stale) {
+                try {
+                    Remove-NetIPAddress -IPAddress $si.IPAddress -InterfaceIndex $script:VAdapter.InterfaceIndex -Confirm:$false -ErrorAction Stop | Out-Null
+                    Log "Removed leftover address $($si.IPAddress) from the hotspot adapter"
+                } catch { Log "Could not remove leftover address $($si.IPAddress): $($_.Exception.Message)" }
+            }
+            $existing = Get-NetIPAddress -InterfaceIndex $script:VAdapter.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                        Where-Object { $_.IPAddress -eq $script:ServerIP }
             if (-not $existing) {
                 New-NetIPAddress -InterfaceIndex $script:VAdapter.InterfaceIndex -IPAddress $script:ServerIP -PrefixLength 24 -ErrorAction Stop | Out-Null
             }
             Log "Router mode: $script:ServerIP/24 set on the hotspot adapter"
+            $script:RouterIpOk = $true
         } catch { Log "Could not set static IP: $($_.Exception.Message)" }
+        # without an address on the hotspot adapter the DHCP server
+        # cannot bind and clients associate but never get online -
+        # that must not be reported as a running hotspot
+        if (-not $script:RouterIpOk) {
+            Log 'Stopping - no address could be set on the hotspot adapter.'
+            # the publisher block above already paused Wi-Fi scans when
+            # VR mode was on - resume them or they stay paused while the
+            # app sits at IDLE (recovered only on close/next launch)
+            try { Disable-VRMode | Out-Null } catch { }
+            try { $script:Pub.Stop() } catch { }
+            $script:Pub = $null
+            return $false
+        }
         try {
             if (Get-NetNat -Name VRHotspotNAT -ErrorAction SilentlyContinue) { Remove-NetNat -Name VRHotspotNAT -Confirm:$false }
             New-NetNat -Name VRHotspotNAT -InternalIPInterfaceAddressPrefix "$($script:Subnet).0/24" -ErrorAction Stop | Out-Null
@@ -1029,14 +1296,20 @@ function Start-Hotspot {
         $sync.ServerIP  = $script:ServerIP
         $sync.PoolStart = 100; $sync.PoolEnd = 200
         $rv = Get-Reservations
+        # only reservations inside the ACTIVE subnet can be honored -
+        # anything else would hand the client an address it cannot use
+        $rvOk = @($rv | Where-Object { $_.ip -like "$($script:Subnet).*" })
         $h = @{}
-        foreach ($r in $rv) { $h[(Norm-Mac $r.mac)] = $r.ip }
+        foreach ($r in $rvOk) { $h[(Norm-Mac $r.mac)] = $r.ip }
         $sync.Reservations = $h
         $script:DhcpRun = [powershell]::Create().AddScript($DhcpSource).AddArgument($sync)
         $script:DhcpHandle = $script:DhcpRun.BeginInvoke()
         Enable-DhcpFirewallRule
-        Log "Built-in DHCP started with $($rv.Count) reservation(s)"
-        foreach ($r in $rv) { Log "  static: $($r.name)  $($r.mac)  -> $($r.ip)" }
+        Log "Built-in DHCP started with $($rvOk.Count) reservation(s)"
+        foreach ($r in $rvOk) { Log "  static: $($r.name)  $($r.mac)  -> $($r.ip)" }
+        foreach ($r in @($rv | Where-Object { $_.ip -notlike "$($script:Subnet).*" })) {
+            Log "  skipped (outside $($script:Subnet).x): $($r.name) $($r.ip) - re-pin it on this subnet"
+        }
         if ($rv.Count -eq 0) {
             Log '  (no reservations yet - connect a device and double-click it to pin one)'
         }
@@ -1057,16 +1330,14 @@ function Start-Hotspot {
                 Invoke-UIPump 300
                 try {
                     $ipa = Get-NetIPAddress -InterfaceIndex $script:VAdapter.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-                           Where-Object { $_.IPAddress -notlike '169.254.*' } | Select-Object -First 1
-                    if ($ipa) { $icsSub = (($ipa.IPAddress -split '\.') | Select-Object -First 3) -join '.'; break }
+                           Where-Object { $_.IPAddress -notlike '169.254.*' } | Sort-Object -Property IPAddress | Select-Object -First 1
+                    if ($ipa) { $icsSub = (($ipa.IPAddress -split '\.') | Select-Object -First 3) -join '.'; $icsAddr = [string]$ipa.IPAddress; break }
                 } catch { }
             }
-            if ($icsSub -and $icsSub -ne $script:Subnet) {
-                $script:Subnet = $icsSub
+            if ($icsSub -and $icsSub -ne $runSub) {
+                $runSub = $icsSub
                 Log "ICS subnet detected: $icsSub.x (adopted for the device list)"
-                if (@(Get-Reservations).Count -gt 0) {
-                    Log "  note: existing reservations use 192.168.137.x - review them if clients now get $icsSub.x addresses"
-                }
+                Log "  (the Hotspot IP box only applies to Router mode)"
             }
         }
         else {
@@ -1078,10 +1349,19 @@ function Start-Hotspot {
         }
     }
 
-    # 4. start the client tracker (device list + latency graph feed)
+    # 4. start the client tracker (device list + latency/bandwidth feed)
     $sync.RouterMode  = $routerMode
     $sync.ScanIfIndex = $script:VAdapter.InterfaceIndex
-    $sync.Subnet      = $script:Subnet
+    $sync.Subnet      = $runSub
+    # runtime gateway: Router mode = the configured one; Shared mode =
+    # the address ICS actually put on the adapter (NOT the configured
+    # router-mode IP - the tracker would filter a client holding it
+    # as "our own address")
+    if ($routerMode) { $sync.ServerIP = $script:ServerIP }
+    elseif ($icsAddr) { $sync.ServerIP = $icsAddr }
+    else { $sync.ServerIP = "$runSub.1" }
+    $sync.BwIfName    = $script:VAdapter.Name
+    $sync.BwIfIndex   = $script:VAdapter.InterfaceIndex
     $sync.GraceOnline = 0
     $sync.GraceRemove = 0
     $sync.Sim         = $false
@@ -1147,12 +1427,45 @@ function Draw-Sparkline {
     $w = $pbLat.Width; $h = $pbLat.Height
     $bmp = New-Object System.Drawing.Bitmap $w, $h
     $g = [System.Drawing.Graphics]::FromImage($bmp)
+    # any exception mid-draw must not leak the bitmap on every tick
+    try {
+        Draw-SparklineInner $bmp $g $w $h
+    }
+    catch {
+        # keep the previous frame, dispose the half-drawn one, and say
+        # so ONCE instead of silently freezing (or spamming every tick)
+        if (-not $script:DrawFailLogged) {
+            $script:DrawFailLogged = $true
+            Log "graph drawing failed: $($_.Exception.Message)"
+        }
+        try { $bmp.Dispose() } catch { }
+        try { $g.Dispose() } catch { }
+        return
+    }
+    $script:DrawFailLogged = $false
+    $g.Dispose()
+    if ($pbLat.Image) { $pbLat.Image.Dispose() }
+    $pbLat.Image = $bmp
+}
+
+function Draw-SparklineInner($bmp, $g, $w, $h) {
     $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
     $g.Clear($GraphBg)
-    $penBase = [System.Drawing.Pen]::new($CardBrd, 1)
-    $g.DrawLine($penBase, 4, ($h - 4), ($w - 4), ($h - 4))
-    $penBase.Dispose()
 
+    # two stacked zones: latency (~62%) on top, bandwidth (~32%) below
+    $latTop = 4
+    $latBot = [int][Math]::Round($h * 0.60)
+    $bwTop  = [int][Math]::Round($h * 0.68)
+    $bwBot  = $h - 4
+    if (($bwBot - $bwTop) -lt 12) { $bwTop = $bwBot - 12 }
+    if (($latBot - $latTop) -lt 12) { $latBot = $bwTop - 3 }
+    $penBase = [System.Drawing.Pen]::new($CardBrd, 1)
+    try {
+        $g.DrawLine($penBase, 4, $latBot, ($w - 4), $latBot)
+        $g.DrawLine($penBase, 4, ($bwTop - 3), ($w - 4), ($bwTop - 3))
+    } finally { $penBase.Dispose() }
+
+    # ---------------- latency zone ----------------
     # ToArray() takes the list's lock - a live enumeration could throw
     # if the tracker appends a sample mid-draw
     $hist = @($sync.PingHist.ToArray())
@@ -1172,15 +1485,16 @@ function Draw-Sparkline {
         $penDrop = [System.Drawing.Pen]::new($Red, 2)
         $fillPts = [System.Collections.Generic.List[System.Drawing.PointF]]::new()
         $prev = [System.Drawing.PointF]::new(-1.0, -1.0)
+        $zoneH = ($latBot - $latTop - 6)
         try {
             for ($i = 0; $i -lt $vn; $i++) {
                 $v = [int]$view[$i]
                 $x = [single](5 + $i * $spacing)
                 if ($v -lt 0) {
-                    $g.DrawLine($penDrop, $x, 4, $x, ($h - 5))
+                    $g.DrawLine($penDrop, $x, ($latTop + 2), $x, ($latBot - 1))
                     if ($fillPts.Count -gt 1) {
-                        $fillPts.Add([System.Drawing.PointF]::new($fillPts[$fillPts.Count - 1].X, [single]($h - 4)))
-                        $fillPts.Add([System.Drawing.PointF]::new($fillPts[0].X, [single]($h - 4)))
+                        $fillPts.Add([System.Drawing.PointF]::new($fillPts[$fillPts.Count - 1].X, [single]$latBot))
+                        $fillPts.Add([System.Drawing.PointF]::new($fillPts[0].X, [single]$latBot))
                         $brush = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(46, 20, 184, 166))
                         try { $g.FillPolygon($brush, $fillPts.ToArray()) } finally { $brush.Dispose() }
                     }
@@ -1188,7 +1502,7 @@ function Draw-Sparkline {
                     $prev = [System.Drawing.PointF]::new(-1.0, -1.0)
                 }
                 else {
-                    $y = [single](($h - 5) - ($v / $maxV) * ($h - 12))
+                    $y = [single]($latBot - 1 - ($v / $maxV) * $zoneH)
                     $pt = [System.Drawing.PointF]::new($x, $y)
                     if ($prev.X -ge 0) { $g.DrawLine($penLine, $prev, $pt) }
                     $fillPts.Add($pt)
@@ -1196,8 +1510,8 @@ function Draw-Sparkline {
                 }
             }
             if ($fillPts.Count -gt 1) {
-                $fillPts.Add([System.Drawing.PointF]::new($fillPts[$fillPts.Count - 1].X, [single]($h - 4)))
-                $fillPts.Add([System.Drawing.PointF]::new($fillPts[0].X, [single]($h - 4)))
+                $fillPts.Add([System.Drawing.PointF]::new($fillPts[$fillPts.Count - 1].X, [single]$latBot))
+                $fillPts.Add([System.Drawing.PointF]::new($fillPts[0].X, [single]$latBot))
                 $brush = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(46, 20, 184, 166))
                 try { $g.FillPolygon($brush, $fillPts.ToArray()) } finally { $brush.Dispose() }
             }
@@ -1229,15 +1543,107 @@ function Draw-Sparkline {
             $lblPing.Text = 'Waiting for a connected client...'
         }
     }
-    $g.Dispose()
-    if ($pbLat.Image) { $pbLat.Image.Dispose() }
-    $pbLat.Image = $bmp
+
+    # ---------------- bandwidth zone ----------------
+    # TX (to devices) = amber filled area, RX (from devices) = indigo
+    # line; both autoscaled to the window maximum, -1 samples skipped.
+    $bwr = @($sync.BwHistR.ToArray())
+    $bwt = @($sync.BwHistT.ToArray())
+    if ($bwr.Count -gt $cap) { $bwr = @($bwr[($bwr.Count - $cap)..($bwr.Count - 1)]) }
+    if ($bwt.Count -gt $cap) { $bwt = @($bwt[($bwt.Count - $cap)..($bwt.Count - 1)]) }
+    $bn = [Math]::Min($bwr.Count, $bwt.Count)
+    $bmax = 0.5
+    if ($bn -gt 1) {
+        for ($i = 0; $i -lt $bn; $i++) {
+            if ([double]$bwt[$i] -gt $bmax) { $bmax = [double]$bwt[$i] }
+            if ([double]$bwr[$i] -gt $bmax) { $bmax = [double]$bwr[$i] }
+        }
+        $bsp = [double]($w - 10) / [double][Math]::Max(1, ($bn - 1))
+        $bzH = ($bwBot - $bwTop - 2)
+        # TX filled area
+        $pts = [System.Collections.Generic.List[System.Drawing.PointF]]::new()
+        for ($i = 0; $i -lt $bn; $i++) {
+            $v = [double]$bwt[$i]
+            $x = [single](5 + $i * $bsp)
+            if ($v -ge 0) {
+                $y = [single]($bwBot - ($v / $bmax) * $bzH)
+                [void]$pts.Add([System.Drawing.PointF]::new($x, $y))
+            }
+            else {
+                if ($pts.Count -gt 1) {
+                    $pts.Add([System.Drawing.PointF]::new($pts[$pts.Count - 1].X, [single]$bwBot))
+                    $pts.Add([System.Drawing.PointF]::new($pts[0].X, [single]$bwBot))
+                    $brush = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(38, 251, 191, 36))
+                    try { $g.FillPolygon($brush, $pts.ToArray()) } finally { $brush.Dispose() }
+                }
+                $pts = [System.Collections.Generic.List[System.Drawing.PointF]]::new()
+            }
+        }
+        if ($pts.Count -gt 1) {
+            $pts.Add([System.Drawing.PointF]::new($pts[$pts.Count - 1].X, [single]$bwBot))
+            $pts.Add([System.Drawing.PointF]::new($pts[0].X, [single]$bwBot))
+            $brush = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(38, 251, 191, 36))
+            try { $g.FillPolygon($brush, $pts.ToArray()) } finally { $brush.Dispose() }
+        }
+        # RX thin line
+        $penRx = [System.Drawing.Pen]::new($BwRxFg, 1.5)
+        try {
+            $prevPt = $null
+            for ($i = 0; $i -lt $bn; $i++) {
+                $v = [double]$bwr[$i]
+                $x = [single](5 + $i * $bsp)
+                if ($v -ge 0) {
+                    $y = [single]($bwBot - ($v / $bmax) * $bzH)
+                    $pt = [System.Drawing.PointF]::new($x, $y)
+                    if ($prevPt) { $g.DrawLine($penRx, $prevPt, $pt) }
+                    $prevPt = $pt
+                }
+                else { $prevPt = $null }
+            }
+        } finally { $penRx.Dispose() }
+    }
+
+    # ---------------- bandwidth captions ----------------
+    if ($lblBwTx -and $lblBwRx) {
+        if ($sync.BwFail) {
+            $lblBwTx.ForeColor = $Muted; $lblBwTx.Text = 'Bandwidth: not available on this system.'
+            $lblBwRx.Text = ''
+        }
+        elseif (-not $sync.BwOk) {
+            $lblBwTx.ForeColor = $Muted; $lblBwTx.Text = 'Bandwidth: measuring...'
+            $lblBwRx.Text = ''
+        }
+        else {
+            $lastT = -1.0; $lastR = -1.0
+            for ($i = $bwt.Count - 1; $i -ge 0; $i--) { if ([double]$bwt[$i] -ge 0) { $lastT = [double]$bwt[$i]; break } }
+            for ($i = $bwr.Count - 1; $i -ge 0; $i--) { if ([double]$bwr[$i] -ge 0) { $lastR = [double]$bwr[$i]; break } }
+            $lblBwTx.ForeColor = $BwTxFg
+            $lblBwRx.ForeColor = $BwRxFg
+            if ($lastT -ge 0) { $lblBwTx.Text = ('To devices: {0:N1} Mbps  (session {1})' -f $lastT, (Format-Bytes ([double]$sync.BwTotalT))) }
+            else { $lblBwTx.Text = 'To devices: waiting for a sample...' }
+            if ($lastR -ge 0) { $lblBwRx.Text = ('From devices: {0:N1} Mbps  (session {1})' -f $lastR, (Format-Bytes ([double]$sync.BwTotalR))) }
+            else { $lblBwRx.Text = 'From devices: waiting for a sample...' }
+        }
+    }
+
+    # small in-graph tag so the two zones cannot be confused: the
+    # bandwidth strip is ADAPTER-WIDE (all devices), unlike the latency
+    # zone which follows the tracked device only
+    try {
+        $tagFont = New-Object System.Drawing.Font('Segoe UI', 6.75)
+        $tagBrush = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(165, 142, 152, 168))
+        try { $g.DrawString('hotspot throughput - all devices', $tagFont, $tagBrush, 8, ($bwTop - 2)) }
+        finally { $tagFont.Dispose(); $tagBrush.Dispose() }
+    } catch { }
 }
 
 function Clear-Sparkline {
     if ($pbLat.Image) { $pbLat.Image.Dispose(); $pbLat.Image = $null }
     if ($lblPing) { $lblPing.ForeColor = $Muted; $lblPing.Text = 'Latency: hotspot not running.' }
+    if ($lblBwTx) { $lblBwTx.ForeColor = $Muted; $lblBwTx.Text = 'Bandwidth: hotspot not running.' }
+    if ($lblBwRx) { $lblBwRx.Text = '' }
 }
+
 # =====================================================================
 # GUI (skipped entirely in self-test mode)
 # =====================================================================
@@ -1269,7 +1675,28 @@ if (-not $script:Singleton.WaitOne(0)) {
     exit 1
 }
 
-# ---------- palette + typography (2025 dark "VR console" look) ----------
+# ---------- DPI awareness + uniform scaling ----------
+# v2.2.0 placed every control at hard-coded 96-DPI pixels: on displays
+# with 125-150% scaling (or an increased Windows text size) labels
+# drifted onto the text boxes. The process now opts into DPI awareness
+# and every coordinate, size and font below goes through SC(), so the
+# window stays crisp and correctly proportioned at any scale. Labels
+# also sit above their input fields now, so even a wider system font
+# cannot collide with an input box.
+try {
+    Add-Type -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetProcessDPIAware();' -Name Dpi -Namespace VRhs -ErrorAction Stop | Out-Null
+    [void][VRhs.Dpi]::SetProcessDPIAware()
+} catch { }
+$script:Scale = 1.0
+try {
+    $g0 = [System.Drawing.Graphics]::FromHwnd([IntPtr]::Zero)
+    $script:Scale = [double]$g0.DpiX / 96.0
+    $g0.Dispose()
+} catch { $script:Scale = 1.0 }
+if ($script:Scale -lt 0.5 -or $script:Scale -gt 4.0) { $script:Scale = 1.0 }
+function SC([double]$v) { [int][Math]::Round($v * $script:Scale) }
+
+# ---------- palette + typography (dark "VR console" look) ----------
 $BgForm   = [System.Drawing.Color]::FromArgb(18, 21, 28)      # deep slate
 $CardBg   = [System.Drawing.Color]::FromArgb(26, 31, 41)
 $CardBrd  = [System.Drawing.Color]::FromArgb(38, 45, 58)
@@ -1291,12 +1718,14 @@ $StopBg   = [System.Drawing.Color]::FromArgb(185, 28, 28)
 $StopHi   = [System.Drawing.Color]::FromArgb(220, 38, 38)
 $BtnBg    = [System.Drawing.Color]::FromArgb(35, 42, 54)
 $BtnBgHi  = [System.Drawing.Color]::FromArgb(48, 57, 73)
+$BwTxFg   = [System.Drawing.Color]::FromArgb(252, 211, 77)    # 'to devices' (graph fill + caption)
+$BwRxFg   = [System.Drawing.Color]::FromArgb(129, 140, 248)   # 'from devices' (graph line + caption)
 
-$FontTitle = New-Object System.Drawing.Font('Segoe UI Semibold', 14)
-$FontHdr   = New-Object System.Drawing.Font('Segoe UI', 8.5, [System.Drawing.FontStyle]::Bold)
-$FontBody  = New-Object System.Drawing.Font('Segoe UI', 9)
-$FontBtn   = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
-$FontMono  = New-Object System.Drawing.Font('Consolas', 8.5)
+$FontTitle = New-Object System.Drawing.Font('Segoe UI Semibold', [float](14 * $script:Scale))
+$FontHdr   = New-Object System.Drawing.Font('Segoe UI', [float](8.5 * $script:Scale), [System.Drawing.FontStyle]::Bold)
+$FontBody  = New-Object System.Drawing.Font('Segoe UI', [float](9 * $script:Scale))
+$FontBtn   = New-Object System.Drawing.Font('Segoe UI', [float](9 * $script:Scale), [System.Drawing.FontStyle]::Bold)
+$FontMono  = New-Object System.Drawing.Font('Consolas', [float](8.5 * $script:Scale))
 
 # dark context menus (a tiny renderer so the right-click menus do not
 # flash white). Compiled once; if it fails we just keep the default.
@@ -1328,19 +1757,22 @@ public class VRhsDarkRenderer : ToolStripProfessionalRenderer {
 } catch { $VRhsDarkMenu = $false }
 
 # ---------- control factories ----------
+# All coordinates are 96-DPI design values; SC() scales them to the
+# real display DPI so nothing overlaps on scaled screens.
 function New-Label([string]$text, [int]$x, [int]$y, [int]$w, $col) {
     $l = New-Object System.Windows.Forms.Label
     $l.Text = $text
-    $l.Location = [System.Drawing.Point]::new($x, $y)
-    $l.Size = [System.Drawing.Size]::new($w, 18)
+    $l.Location = [System.Drawing.Point]::new((SC $x), (SC $y))
+    $l.Size = [System.Drawing.Size]::new((SC $w), (SC 15))
     $l.ForeColor = $col; $l.Font = $FontBody; $l.BackColor = [System.Drawing.Color]::Transparent
+    $l.AutoEllipsis = $true
     return $l
 }
 
 function New-Box([int]$x, [int]$y, [int]$w) {
     $t = New-Object System.Windows.Forms.TextBox
-    $t.Location = [System.Drawing.Point]::new($x, $y)
-    $t.Size = [System.Drawing.Size]::new($w, 24)
+    $t.Location = [System.Drawing.Point]::new((SC $x), (SC $y))
+    $t.Size = [System.Drawing.Size]::new((SC $w), (SC 24))
     $t.BackColor = $InputBg; $t.ForeColor = $White
     $t.BorderStyle = 'FixedSingle'; $t.Font = $FontBody
     return $t
@@ -1349,8 +1781,8 @@ function New-Box([int]$x, [int]$y, [int]$w) {
 function New-Chk([string]$text, [int]$x, [int]$y, [int]$w) {
     $c = New-Object System.Windows.Forms.CheckBox
     $c.Text = $text
-    $c.Location = [System.Drawing.Point]::new($x, $y)
-    $c.Size = [System.Drawing.Size]::new($w, 22)
+    $c.Location = [System.Drawing.Point]::new((SC $x), (SC $y))
+    $c.Size = [System.Drawing.Size]::new((SC $w), (SC 24))
     $c.ForeColor = $BodyText; $c.BackColor = $CardBg; $c.Font = $FontBody
     return $c
 }
@@ -1358,8 +1790,8 @@ function New-Chk([string]$text, [int]$x, [int]$y, [int]$w) {
 function New-Btn([string]$text, [int]$x, [int]$y, [int]$w, [int]$h, $bg, $fg, $hover) {
     $b = New-Object System.Windows.Forms.Button
     $b.Text = $text
-    $b.Location = [System.Drawing.Point]::new($x, $y)
-    $b.Size = [System.Drawing.Size]::new($w, $h)
+    $b.Location = [System.Drawing.Point]::new((SC $x), (SC $y))
+    $b.Size = [System.Drawing.Size]::new((SC $w), (SC $h))
     $b.FlatStyle = 'Flat'
     $b.FlatAppearance.BorderSize = 0
     $b.BackColor = $bg; $b.ForeColor = $fg
@@ -1369,18 +1801,26 @@ function New-Btn([string]$text, [int]$x, [int]$y, [int]$w, [int]$h, $bg, $fg, $h
     return $b
 }
 
+function Set-DoubleBuffered($c) {
+    try {
+        $pi = $c.GetType().GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'Instance,NonPublic')
+        if ($pi) { $pi.SetValue($c, $true, $null) }
+    } catch { }
+}
+
 # a flat "card": panel with a 1px border painted on it and a small
-# uppercase section header baked in
+# uppercase section header baked in (the header zone y 8-24 is reserved:
+# card content starts at y 22 or lower)
 function New-Card([string]$title, [int]$x, [int]$y, [int]$w, [int]$h) {
     $p = New-Object System.Windows.Forms.Panel
-    $p.Location = [System.Drawing.Point]::new($x, $y)
-    $p.Size = [System.Drawing.Size]::new($w, $h)
+    $p.Location = [System.Drawing.Point]::new((SC $x), (SC $y))
+    $p.Size = [System.Drawing.Size]::new((SC $w), (SC $h))
     $p.BackColor = $CardBg
     Set-DoubleBuffered $p
     $t = New-Object System.Windows.Forms.Label
-    $t.Text = $title.ToUpper()
-    $t.Location = [System.Drawing.Point]::new(14, 8)
-    $t.Size = [System.Drawing.Size]::new(($w - 28), 16)
+    $t.Text = $title.ToUpper([System.Globalization.CultureInfo]::InvariantCulture)
+    $t.Location = [System.Drawing.Point]::new((SC 14), (SC 8))
+    $t.Size = [System.Drawing.Size]::new((SC ($w - 28)), (SC 16))
     $t.ForeColor = $Muted; $t.Font = $FontHdr
     $t.BackColor = [System.Drawing.Color]::Transparent
     $p.Controls.Add($t)
@@ -1395,13 +1835,6 @@ function New-Card([string]$title, [int]$x, [int]$y, [int]$w, [int]$h) {
     return $p
 }
 
-function Set-DoubleBuffered($c) {
-    try {
-        $pi = $c.GetType().GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'Instance,NonPublic')
-        if ($pi) { $pi.SetValue($c, $true, $null) }
-    } catch { }
-}
-
 # ---------- form ----------
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "VR Hotspot Studio v$AppVersion"
@@ -1410,41 +1843,41 @@ $form.BackColor = $BgForm
 $form.FormBorderStyle = 'FixedSingle'
 $form.MaximizeBox = $false
 $form.Font = $FontBody
-$wantW = 580
+$wantW = 600
 # fit the window to the screen: on small displays the form scrolls
 # instead of cutting off the log and status bar. The window is widened
 # in scroll mode so the vertical scrollbar does not push a horizontal
 # one onto the cards.
-$wantH = 1012
-$formH = $wantH
+$wantH = 1042
+$formHpx = SC $wantH
 try {
     $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-    if ($wa.Height - 16 -lt $wantH) {
-        $formH = $wa.Height - 16
+    if (($wa.Height - 16) -lt $formHpx) {
+        $formHpx = $wa.Height - 16
         $form.AutoScroll = $true
-        $form.AutoScrollMinSize = [System.Drawing.Size]::new(564, 980)
-        $wantW = 600
+        $form.AutoScrollMinSize = [System.Drawing.Size]::new((SC 568), (SC 1002))
+        $wantW = 620
     }
 } catch { }
-$form.Size = [System.Drawing.Size]::new($wantW, $formH)
+$form.Size = [System.Drawing.Size]::new((SC $wantW), $formHpx)
 Set-DoubleBuffered $form
 
 # ---------- header band ----------
 $title = New-Object System.Windows.Forms.Label
 $title.Text = 'VR HOTSPOT STUDIO'
-$title.Location = [System.Drawing.Point]::new(16, 10)
-$title.Size = [System.Drawing.Size]::new(400, 30)
+$title.Location = [System.Drawing.Point]::new((SC 16), (SC 10))
+$title.Size = [System.Drawing.Size]::new((SC 400), (SC 30))
 $title.ForeColor = $White; $title.Font = $FontTitle
 $form.Controls.Add($title)
-$sub = New-Label 'standalone Wi-Fi Direct hotspot - works even with a broken tethering stack' 16 42 420 $Muted
+$sub = New-Label 'standalone Wi-Fi Direct hotspot - no tethering stack' 16 42 424 $Muted
 $form.Controls.Add($sub)
 
 # status pill (custom-painted capsule on the right of the header)
 $script:PillText  = 'IDLE'
 $script:PillColor = $Muted
 $script:PillPanel = New-Object System.Windows.Forms.Panel
-$script:PillPanel.Location = [System.Drawing.Point]::new(436, 14)
-$script:PillPanel.Size = [System.Drawing.Size]::new(132, 30)
+$script:PillPanel.Location = [System.Drawing.Point]::new((SC 448), (SC 14))
+$script:PillPanel.Size = [System.Drawing.Size]::new((SC 132), (SC 30))
 $script:PillPanel.Font = $FontBtn
 Set-DoubleBuffered $script:PillPanel
 $script:PillPanel.Add_Paint({
@@ -1480,100 +1913,118 @@ function Set-Pill([string]$text, $color) {
 }
 
 # ---------- card: hotspot ----------
-$gHot = New-Card 'Hotspot' 16 64 544 114
+# left column: SSID + password (labels ABOVE the boxes - v2.2.0 put
+# them to the left with a 6 px overlap on 'Password')
+$gHot = New-Card 'Hotspot' 16 58 568 126
 $form.Controls.Add($gHot)
-$gHot.Controls.Add((New-Label 'SSID' 16 34 48 $BodyText))
-$tSsid = New-Box 66 31 176;  $gHot.Controls.Add($tSsid)
-$gHot.Controls.Add((New-Label 'Password' 16 68 56 $BodyText))
-$tPass = New-Box 66 65 176;  $gHot.Controls.Add($tPass)
-$cbShow = New-Chk 'show' 248 66 60; $gHot.Controls.Add($cbShow)
-$btnCopy = New-Btn 'Copy SSID+pass' 248 29 112 26 $BtnBg $White $BtnBgHi
+$gHot.Controls.Add((New-Label 'SSID' 16 30 100 $BodyText))
+$tSsid = New-Box 16 46 172;  $gHot.Controls.Add($tSsid)
+$gHot.Controls.Add((New-Label 'Password' 196 30 100 $BodyText))
+$tPass = New-Box 196 46 172; $gHot.Controls.Add($tPass)
+$cbShow = New-Chk 'Show' 372 48 56; $gHot.Controls.Add($cbShow)
+$btnCopy = New-Btn 'Copy SSID + pass' 16 78 172 24 $BtnBg $White $BtnBgHi
 $gHot.Controls.Add($btnCopy)
-$btnStart = New-Btn 'START' 410 26 118 40 $StartBg $White $StartHi
+$btnStart = New-Btn 'START' 436 40 116 44 $StartBg $White $StartHi
 $gHot.Controls.Add($btnStart)
-$btnStop = New-Btn 'STOP' 410 70 118 30 $StopBg $White $StopHi
+$btnStop = New-Btn 'STOP' 436 90 116 30 $StopBg $White $StopHi
 $btnStop.Enabled = $false
 $gHot.Controls.Add($btnStop)
 
 # ---------- card: internet sharing ----------
-$gShare = New-Card 'Internet sharing' 16 184 544 110
+$gShare = New-Card 'Internet sharing' 16 192 568 158
 $form.Controls.Add($gShare)
-$gShare.Controls.Add((New-Label 'Uplink' 16 32 48 $BodyText))
+$gShare.Controls.Add((New-Label 'Uplink (adapter that has internet)' 16 30 260 $BodyText))
 $cbUp = New-Object System.Windows.Forms.ComboBox
-$cbUp.Location = [System.Drawing.Point]::new(66, 29)
-$cbUp.Size = [System.Drawing.Size]::new(210, 24)
+$cbUp.Location = [System.Drawing.Point]::new((SC 16), (SC 46))
+$cbUp.Size = [System.Drawing.Size]::new((SC 300), (SC 24))
 $cbUp.BackColor = $InputBg; $cbUp.ForeColor = $White
 $cbUp.FlatStyle = 'Flat'; $cbUp.Font = $FontBody
 $cbUp.DropDownStyle = 'DropDownList'
 $gShare.Controls.Add($cbUp)
-$cbRouter = New-Chk 'Router mode (own DHCP + static IP reservations)' 16 60 430
+$cbRouter = New-Chk 'Router mode (own DHCP + static IP reservations)' 16 74 440
 $gShare.Controls.Add($cbRouter)
-$cbAuto = New-Chk 'Auto-start on launch' 16 82 170
+$gShare.Controls.Add((New-Label 'Hotspot IP' 24 104 90 $BodyText))
+$tIp = New-Box 118 100 130
+$tIp.Font = $FontMono
+$gShare.Controls.Add($tIp)
+$lblIpErr = New-Label 'Router mode - applies on next start' 258 104 294 $Muted
+$gShare.Controls.Add($lblIpErr)
+$cbAuto = New-Chk 'Auto-start on launch' 16 130 160
 $gShare.Controls.Add($cbAuto)
-$cbVR = New-Chk 'VR mode (pause Windows Wi-Fi scans while running)' 200 82 330
+$cbVR = New-Chk 'VR mode (pause Windows Wi-Fi scans while running)' 184 130 368
 $gShare.Controls.Add($cbVR)
 
 # ---------- card: connected devices ----------
-$gClients = New-Card 'Connected devices' 16 298 544 172
+$gClients = New-Card 'Connected devices' 16 356 568 156
 $form.Controls.Add($gClients)
 $lvClients = New-Object System.Windows.Forms.ListView
-$lvClients.Location = [System.Drawing.Point]::new(14, 26)
-$lvClients.Size = [System.Drawing.Size]::new(516, 104)
+$lvClients.Location = [System.Drawing.Point]::new((SC 14), (SC 26))
+$lvClients.Size = [System.Drawing.Size]::new((SC 540), (SC 88))
 $lvClients.View = 'Details'; $lvClients.FullRowSelect = $true
 $lvClients.HeaderStyle = 'Nonclickable'
 $lvClients.HideSelection = $false
 $lvClients.BackColor = $InputBg; $lvClients.ForeColor = $White
 $lvClients.BorderStyle = 'FixedSingle'; $lvClients.Font = $FontBody
 Set-DoubleBuffered $lvClients
-foreach ($c in @(@('Device', 178), @('IP', 100), @('MAC', 142), @('Status', 70))) {
-    [void]$lvClients.Columns.Add($c[0], $c[1])
+foreach ($c in @(@('Device', 200), @('IP', 105), @('MAC', 150), @('Status', 85))) {
+    [void]$lvClients.Columns.Add($c[0], (SC $c[1]))
 }
 $gClients.Controls.Add($lvClients)
-$btnPin = New-Btn 'Pin static IP' 14 136 122 28 $AccentBtn $White $AccentHi
+$btnPin = New-Btn 'Pin static IP' 14 122 122 26 $AccentBtn $White $AccentHi
 $gClients.Controls.Add($btnPin)
-$gClients.Controls.Add((New-Label 'double-click pins its IP - right-click watches its latency' 146 141 384 $Muted))
+$gClients.Controls.Add((New-Label 'double-click pins its static IP - right-click for more options' 146 126 408 $Muted))
 
 # ---------- card: static IP reservations ----------
-$gResv = New-Card 'Static IP reservations (Router mode)' 16 474 544 172
+$gResv = New-Card 'Static IP reservations (Router mode)' 16 518 568 156
 $form.Controls.Add($gResv)
 $lvResv = New-Object System.Windows.Forms.ListView
-$lvResv.Location = [System.Drawing.Point]::new(14, 26)
-$lvResv.Size = [System.Drawing.Size]::new(396, 104)
+$lvResv.Location = [System.Drawing.Point]::new((SC 14), (SC 26))
+$lvResv.Size = [System.Drawing.Size]::new((SC 404), (SC 88))
 $lvResv.View = 'Details'; $lvResv.FullRowSelect = $true
 $lvResv.HeaderStyle = 'Nonclickable'
 $lvResv.HideSelection = $false
 $lvResv.BackColor = $InputBg; $lvResv.ForeColor = $White
 $lvResv.BorderStyle = 'FixedSingle'; $lvResv.Font = $FontBody
 Set-DoubleBuffered $lvResv
-foreach ($c in @(@('Name', 122), @('MAC', 140), @('IP', 100))) {
-    [void]$lvResv.Columns.Add($c[0], $c[1])
+foreach ($c in @(@('Name', 150), @('MAC', 150), @('IP', 104))) {
+    [void]$lvResv.Columns.Add($c[0], (SC $c[1]))
 }
 $gResv.Controls.Add($lvResv)
-$gResv.Controls.Add((New-Label 'reserved devices keep their address across reconnects (Router mode)' 14 136 384 $Muted))
-$btnResAdd = New-Btn 'Add' 420 26 110 32 $AccentBtn $White $AccentHi
+$gResv.Controls.Add((New-Label 'reserved devices keep their address across reconnects' 14 126 404 $Muted))
+$btnResAdd = New-Btn 'Add' 432 26 122 32 $AccentBtn $White $AccentHi
 $gResv.Controls.Add($btnResAdd)
-$btnResDel = New-Btn 'Remove' 420 64 110 32 $BtnBg $White $BtnBgHi
+$btnResDel = New-Btn 'Remove' 432 64 122 32 $BtnBg $White $BtnBgHi
 $gResv.Controls.Add($btnResDel)
 
-# ---------- card: latency ----------
-$gLat = New-Card 'Latency (live ping to the tracked client)' 16 650 544 132
+# ---------- card: latency + bandwidth ----------
+$gLat = New-Card 'Latency + bandwidth' 16 680 568 172
 $form.Controls.Add($gLat)
-$lblPing = New-Label 'Latency: waiting for a hotspot...' 14 22 516 $BodyText
-$lblPing.AutoEllipsis = $true
+$lblPing = New-Label 'Latency: waiting for a hotspot...' 14 25 330 $BodyText
 $gLat.Controls.Add($lblPing)
+$cbTrack = New-Object System.Windows.Forms.ComboBox
+$cbTrack.Location = [System.Drawing.Point]::new((SC 356), (SC 25))
+$cbTrack.Size = [System.Drawing.Size]::new((SC 198), (SC 24))
+$cbTrack.BackColor = $InputBg; $cbTrack.ForeColor = $White
+$cbTrack.FlatStyle = 'Flat'; $cbTrack.Font = $FontBody
+$cbTrack.DropDownStyle = 'DropDownList'
+$gLat.Controls.Add($cbTrack)
 $pbLat = New-Object System.Windows.Forms.PictureBox
-$pbLat.Location = [System.Drawing.Point]::new(14, 44)
-$pbLat.Size = [System.Drawing.Size]::new(516, 78)
+$pbLat.Location = [System.Drawing.Point]::new((SC 14), (SC 53))
+$pbLat.Size = [System.Drawing.Size]::new((SC 540), (SC 84))
 $pbLat.BackColor = $GraphBg
 $pbLat.BorderStyle = 'FixedSingle'
 $gLat.Controls.Add($pbLat)
+$lblBwTx = New-Label '' 14 144 266 $BwTxFg
+$gLat.Controls.Add($lblBwTx)
+$lblBwRx = New-Label '' 286 144 268 $BwRxFg
+$gLat.Controls.Add($lblBwRx)
 
 # ---------- card: log ----------
-$gLog = New-Card 'Log' 16 786 544 160
+$gLog = New-Card 'Log' 16 858 568 112
 $form.Controls.Add($gLog)
 $tbLog = New-Object System.Windows.Forms.TextBox
-$tbLog.Location = [System.Drawing.Point]::new(14, 26)
-$tbLog.Size = [System.Drawing.Size]::new(516, 122)
+$tbLog.Location = [System.Drawing.Point]::new((SC 14), (SC 26))
+$tbLog.Size = [System.Drawing.Size]::new((SC 540), (SC 76))
 $tbLog.Multiline = $true; $tbLog.ScrollBars = 'Vertical'
 $tbLog.ReadOnly = $true
 $tbLog.BackColor = $GraphBg
@@ -1584,8 +2035,8 @@ $gLog.Controls.Add($tbLog)
 # ---------- status strip ----------
 $status = New-Object System.Windows.Forms.Label
 $status.Text = 'Idle - hotspot not running.'
-$status.Location = [System.Drawing.Point]::new(16, 952)
-$status.Size = [System.Drawing.Size]::new(544, 20)
+$status.Location = [System.Drawing.Point]::new((SC 16), (SC 978))
+$status.Size = [System.Drawing.Size]::new((SC 568), (SC 18))
 $status.ForeColor = $BodyText; $status.Font = $FontBtn
 $status.AutoEllipsis = $true
 $form.Controls.Add($status)
@@ -1632,7 +2083,7 @@ $form.Add_Resize({
 # =====================================================================
 $dlgForm = New-Object System.Windows.Forms.Form
 $dlgForm.Text = 'Pin a static IP'
-$dlgForm.Size = [System.Drawing.Size]::new(376, 348)
+$dlgForm.Size = [System.Drawing.Size]::new((SC 376), (SC 348))
 $dlgForm.StartPosition = 'CenterParent'
 $dlgForm.BackColor = $BgForm
 $dlgForm.FormBorderStyle = 'FixedDialog'
@@ -1643,8 +2094,8 @@ $dlgByText = @{}
 
 $dlgForm.Controls.Add((New-Label 'Copy details from a connected device:' 16 14 330 $BodyText))
 $dlgPick = New-Object System.Windows.Forms.ComboBox
-$dlgPick.Location = [System.Drawing.Point]::new(16, 34)
-$dlgPick.Size = [System.Drawing.Size]::new(336, 24)
+$dlgPick.Location = [System.Drawing.Point]::new((SC 16), (SC 34))
+$dlgPick.Size = [System.Drawing.Size]::new((SC 336), (SC 24))
 $dlgPick.BackColor = $InputBg; $dlgPick.ForeColor = $White
 $dlgPick.FlatStyle = 'Flat'; $dlgPick.Font = $FontBody
 $dlgPick.DropDownStyle = 'DropDownList'
@@ -1658,8 +2109,8 @@ $dlgForm.Controls.Add((New-Label 'Static IP (suggested: .50 - .99 range)' 16 180
 $dlgT3 = New-Box 16 200 160; $dlgForm.Controls.Add($dlgT3)
 $dlgErr = New-Object System.Windows.Forms.Label
 $dlgErr.Text = ''
-$dlgErr.Location = [System.Drawing.Point]::new(16, 230)
-$dlgErr.Size = [System.Drawing.Size]::new(336, 18)
+$dlgErr.Location = [System.Drawing.Point]::new((SC 16), (SC 230))
+$dlgErr.Size = [System.Drawing.Size]::new((SC 336), (SC 18))
 $dlgErr.ForeColor = $Red; $dlgErr.Font = $FontBody
 $dlgForm.Controls.Add($dlgErr)
 
@@ -1670,8 +2121,8 @@ $dlgForm.Controls.Add($dlgCancel)
 $dlgForm.AcceptButton = $dlgSave
 $dlgForm.CancelButton = $dlgCancel
 # =====================================================================
-# latency graph drawing lives in the core section (see note there);
-# this file only wires the GUI around it
+# latency + bandwidth graph drawing lives in the core section (see the
+# note there); this file only wires the GUI around it
 # =====================================================================
 
 # =====================================================================
@@ -1750,6 +2201,56 @@ $script:Busy         = $false
 $script:ClosePending = $false
 $script:SparkIdle    = $false
 $script:ScanDeadLogged = $false
+# graph target picker state
+$script:TrackByText  = @{}
+$script:TrackLastKey = $null    # $null (not '') so the FIRST tick always
+                                # populates the Auto entry (v2.2.0 left the
+                                # dropdown blank until a device appeared)
+$script:TrackSync    = $false
+
+# validate + apply the Hotspot IP box. Returns $true when the value is
+# valid; on a subnet CHANGE it updates $script:Subnet (used from the
+# next start on), flags out-of-subnet reservations and logs it.
+function Update-ServerIPField([bool]$fromUser) {
+    $sub = Test-ServerIP $tIp.Text
+    if ($null -eq $sub) {
+        $lblIpErr.ForeColor = $Red
+        $lblIpErr.Text = $script:IpErr
+        return $false
+    }
+    $canon = [string]$script:IpCanonical
+    if ($canon) { $tIp.Text = $canon }
+    if ($sub -ne $script:Subnet) {
+        $script:Subnet = $sub
+        $script:ServerIP = $canon
+        if ($fromUser) {
+            $outside = @((Get-Reservations) | Where-Object { $_.ip -notlike "$sub.*" })
+            Log "Hotspot subnet set to $canon/24 (Router mode - applies on next start)"
+            if ($outside.Count -gt 0) {
+                Log "  note: $($outside.Count) reservation(s) are outside $sub.x - they are ignored until re-pinned"
+            }
+        }
+    }
+    else { $script:ServerIP = $canon }
+    $lblIpErr.ForeColor = $Muted
+    $lblIpErr.Text = 'Router mode - applies on next start'
+    return $true
+}
+
+# keep the Hotspot IP box + its hint in step with the Router-mode
+# checkbox. Called from the CheckedChanged handler AND once at init -
+# WinForms only raises CheckedChanged on an actual change, so a saved
+# routerMode=false used to leave the box wrongly enabled at startup.
+function Sync-RouterUI {
+    $tIp.Enabled = [bool]$cbRouter.Checked
+    if ($cbRouter.Checked) {
+        [void](Update-ServerIPField $false)
+    }
+    else {
+        $lblIpErr.ForeColor = $Muted
+        $lblIpErr.Text = 'Router mode only - in Shared mode Windows ICS picks the subnet'
+    }
+}
 
 function Invoke-StartHotspot {
     if ($script:Running) { Log 'Hotspot is already running.'; return }
@@ -1759,6 +2260,12 @@ function Invoke-StartHotspot {
         Log 'No uplink selected - is any network adapter connected?'
         return
     }
+    if ($cbRouter.Checked -and -not (Update-ServerIPField $false)) {
+        Log 'Fix the Hotspot IP in the Internet sharing card before starting.'
+        $status.Text = 'Start blocked - invalid Hotspot IP.'
+        $status.ForeColor = $Red
+        return
+    }
     $script:Busy = $true
     $btnStart.Enabled = $false
     $btnStop.Enabled = $false
@@ -1766,7 +2273,7 @@ function Invoke-StartHotspot {
     $status.Text = 'Bringing the hotspot up...'
     $status.ForeColor = $BodyText
     try {
-        Save-Settings $tSsid.Text $tPass.Text $uplink ([bool]$cbRouter.Checked) ([bool]$cbVR.Checked) ([bool]$cbAuto.Checked)
+        Save-Settings $tSsid.Text $tPass.Text $uplink ([bool]$cbRouter.Checked) ([bool]$cbVR.Checked) ([bool]$cbAuto.Checked) $tIp.Text.Trim()
         $ok = Start-Hotspot -ssid $tSsid.Text -pass $tPass.Text -uplinkName $uplink -routerMode ([bool]$cbRouter.Checked) -vrMode ([bool]$cbVR.Checked)
         $script:Running = $ok
         if ($ok) {
@@ -1779,9 +2286,10 @@ function Invoke-StartHotspot {
         else {
             Set-Pill 'IDLE' $Muted
             # surface the failure next to the button, not only in the log
+            # (strip the log timestamp so it fits and reads clean)
             $ls = $sync.Log.ToArray()
             $lastLog = ''
-            if ($ls.Count -gt 0) { $lastLog = [string]$ls[$ls.Count - 1] }
+            if ($ls.Count -gt 0) { $lastLog = ([string]$ls[$ls.Count - 1] -replace '^\d{2}:\d{2}:\d{2}\s+', '') }
             $status.Text = "Start failed - $lastLog"
             $status.ForeColor = $Red
             $btnStart.Enabled = $true
@@ -1859,6 +2367,10 @@ $btnCopy.Add_Click({
     } catch { Log "Clipboard copy failed: $($_.Exception.Message)" }
 })
 
+# ----- hotspot IP field -----
+$tIp.Add_Leave({ [void](Update-ServerIPField $true) })
+$cbRouter.Add_CheckedChanged({ Sync-RouterUI })
+
 # ----- reservation dialog wiring -----
 $dlgPick.Add_SelectedIndexChanged({
     $c = $dlgByText[[string]$dlgPick.Text]
@@ -1866,7 +2378,7 @@ $dlgPick.Add_SelectedIndexChanged({
         $nm = Resolve-DeviceName ([string]$c.macKey)
         if ($nm) { $dlgT1.Text = $nm }
         $dlgT2.Text = [string]$c.macDisp
-        if ($dlgT3.Text -eq '' -or $dlgT3.Text -eq "$($script:Subnet).50") { $dlgT3.Text = (Get-SuggestedIP) }
+        if ($dlgT3.Text -eq '' -or $dlgT3.Text -eq "$(Get-ActiveSubnet).50") { $dlgT3.Text = (Get-SuggestedIP) }
     }
 })
 
@@ -1877,11 +2389,19 @@ $dlgSave.Add_Click({
     $ipOk = [System.Net.IPAddress]::TryParse($dlgT3.Text.Trim(), [ref]$ipObj)
     if (-not $macN -or $macN -notmatch '^[0-9a-f]{12}$') { $dlgErr.Text = 'MAC address does not look valid.'; return }
     if (-not $ipOk) { $dlgErr.Text = 'Static IP is not a valid IP address.'; return }
-    if ($dlgT3.Text.Trim() -notlike "$($script:Subnet).*") { $dlgErr.Text = "IP must be in $($script:Subnet).x (same subnet as the hotspot)."; return }
+    # validate against the subnet the hotspot is RUNNING on (Shared mode
+    # adopts the ICS one), not the not-yet-applied one from the IP box
+    $actSub = Get-ActiveSubnet
+    if ($dlgT3.Text.Trim() -notlike "$actSub.*") { $dlgErr.Text = "IP must be in $actSub.x (same subnet as the hotspot)."; return }
+    # the gateway is no longer necessarily .1 - block whatever the
+    # hotspot PC itself answers on
+    $gws = @("$actSub.1", "$($script:Subnet).1")
+    if ($script:ServerIP) { $gws += $script:ServerIP }
+    if ($script:Running -and [string]$sync.ServerIP) { $gws += [string]$sync.ServerIP }
+    if ($gws -contains $dlgT3.Text.Trim()) { $dlgErr.Text = "$($dlgT3.Text.Trim()) is the hotspot PC itself - pick another address."; return }
     $oct = -1
     if ($dlgT3.Text.Trim() -match '\.(\d+)$') { $oct = [int]$Matches[1] }
     if ($oct -eq 0 -or $oct -eq 255) { $dlgErr.Text = 'That address is the network or broadcast address - pick another.'; return }
-    if ($oct -eq 1) { $dlgErr.Text = ".$oct is the hotspot PC itself - pick another address."; return }
     if ($oct -ge 100 -and $oct -le 200) { $dlgErr.Text = ".$oct is inside the dynamic pool (.100-.200) - pick .2-.99 so dynamic clients cannot collide."; return }
     $list = @(Get-Reservations | Where-Object { $_.mac -ne $macN })
     $clash = @($list | Where-Object { $_.ip -eq $dlgT3.Text.Trim() })
@@ -1965,18 +2485,37 @@ $ctxPin.Add_Click({
     Show-ReserveDialog ([string]$it.Tag) $it.SubItems[1].Text $it.Text
 })
 
-$ctxWatch.Add_Click({
-    if ($lvClients.SelectedItems.Count -eq 0) { return }
-    $it = $lvClients.SelectedItems[0]
-    $ip = $it.SubItems[1].Text
-    $nm = $it.Text
-    if ($nm -eq 'client') { $nm = $it.SubItems[2].Text }
+# point the graph at a device: sets the tracker's target + lock, then
+# mirrors the choice into the visible Track dropdown
+function Watch-ClientByTag([string]$macKey) {
+    $ip = $null; $nm = $null
+    foreach ($c in @($sync.Clients)) {
+        if ([string]$c.macKey -eq $macKey) { $ip = [string]$c.ip; $nm = Resolve-DeviceName $macKey; break }
+    }
+    if (-not $ip) { return }
+    if (-not $nm) { $nm = 'client' }
     $sync.PingTarget = $ip
-    $sync.TargetMac = [string]$it.Tag
+    $sync.TargetMac = $macKey
     $sync.TargetName = $nm
     $sync.TargetLocked = $true
     $sync.PingHist.Clear()
-    Log "Latency graph is now tracking $nm ($ip) - right-click another device to switch."
+    # force the next tick to rebuild the dropdown: a Watch click that
+    # lands before the device set changed would otherwise leave the
+    # combo showing a stale selection forever
+    $script:TrackLastKey = $null
+    $script:TrackSync = $true
+    try {
+        foreach ($tk in @($script:TrackByText.Keys)) {
+            if ([string]$script:TrackByText[$tk] -eq $macKey) { $cbTrack.SelectedItem = $tk; break }
+        }
+    } finally { $script:TrackSync = $false }
+    Log "Latency graph is now tracking $nm ($ip) - switch devices in the Track list or right-click."
+}
+
+$ctxWatch.Add_Click({
+    if ($lvClients.SelectedItems.Count -eq 0) { return }
+    $it = $lvClients.SelectedItems[0]
+    Watch-ClientByTag ([string]$it.Tag)
 })
 
 $ctxCopy.Add_Click({
@@ -1987,8 +2526,65 @@ $ctxCopy.Add_Click({
     } catch { Log "Clipboard copy failed: $($_.Exception.Message)" }
 })
 
+# ----- graph target dropdown (the visible device picker) -----
+$cbTrack.Add_SelectedIndexChanged({
+    if ($script:TrackSync) { return }
+    $txt = [string]$cbTrack.SelectedItem
+    if (-not $txt) { return }
+    if ($txt -like 'Auto*') {
+        $sync.TargetLocked = $false
+        $sync.PingTarget = $null
+        Log 'Graph tracking: automatic (first connected device).'
+        return
+    }
+    $macKey = [string]$script:TrackByText[$txt]
+    if ($macKey) { Watch-ClientByTag $macKey }
+})
+
+# refresh the Track dropdown when the device set changes (guarded by
+# TrackSync so the programmatic selection cannot retrigger the handler)
+function Update-TrackCombo {
+    $devKey = ''
+    foreach ($c in @($sync.Clients)) { $devKey += ('{0}|{1};' -f $c.macKey, $c.ip) }
+    if ($devKey -eq $script:TrackLastKey) { return }
+    $script:TrackLastKey = $devKey
+    $script:TrackSync = $true
+    try {
+        $selMac = ''
+        if ($cbTrack.SelectedIndex -gt 0 -and $cbTrack.SelectedItem) {
+            $selMac = [string]$script:TrackByText[[string]$cbTrack.SelectedItem]
+        }
+        $cbTrack.Items.Clear()
+        $script:TrackByText = @{}
+        [void]$cbTrack.Items.Add('Auto (first connected device)')
+        foreach ($c in @($sync.Clients)) {
+            $nm = Resolve-DeviceName ([string]$c.macKey)
+            if (-not $nm) { $nm = 'client' }
+            $txt = ('{0}  ({1})' -f $nm, $c.ip)
+            $script:TrackByText[$txt] = [string]$c.macKey
+            [void]$cbTrack.Items.Add($txt)
+        }
+        $pickIdx = 0
+        $wantMac = $selMac
+        if (-not $wantMac -and $sync.TargetLocked) { $wantMac = [string]$sync.TargetMac }
+        if ($wantMac) {
+            $items = @($cbTrack.Items)
+            foreach ($tk in @($script:TrackByText.Keys)) {
+                if ([string]$script:TrackByText[$tk] -eq $wantMac) {
+                    $pickIdx = [Array]::IndexOf($items, $tk)
+                    break
+                }
+            }
+        }
+        if ($pickIdx -lt 0) { $pickIdx = 0 }
+        $cbTrack.SelectedIndex = $pickIdx
+    }
+    finally { $script:TrackSync = $false }
+}
+
 # =====================================================================
-# poll timer: log tail, publisher health, device list, latency, status
+# poll timer: log tail, publisher health, device list, latency +
+# bandwidth graph, track dropdown, status
 # =====================================================================
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 1000
@@ -2011,13 +2607,18 @@ $timer.Add_Tick({
         $tbLog.Tag = $logSnap.Count
     }
 
+    # keep the graph's device dropdown in step with the live device set
+    Update-TrackCombo
+
     if ($script:Busy) { return }
 
     if (-not $script:Running) {
         Render-Clients
         if (-not $script:SparkIdle) { Clear-Sparkline; $script:SparkIdle = $true }
+        if ($cbTrack.Enabled) { $cbTrack.Enabled = $false }
         return
     }
+    if (-not $cbTrack.Enabled) { $cbTrack.Enabled = $true }
 
     # ---- tracker liveness: a dead runspace must not freeze silently ----
     if ($script:ScanHandle -and $script:ScanHandle.IsCompleted -and -not $script:ScanDeadLogged) {
@@ -2038,7 +2639,7 @@ $timer.Add_Tick({
                 Stop-Hotspot
                 $script:Running = $false
                 Set-Pill 'LOST' $Red
-                $status.Text = 'Status: hotspot LOST - restart it.'
+                $status.Text = 'Hotspot LOST - restart it.'
                 $status.ForeColor = $Red
                 Clear-Sparkline
                 Refresh-Uplinks
@@ -2051,14 +2652,14 @@ $timer.Add_Tick({
         }
     }
 
-    # ---- device list + latency (both sharing modes) ----
+    # ---- device list + latency/bandwidth graph (both sharing modes) ----
     Render-Clients
     Draw-Sparkline
     $script:SparkIdle = $false
 
     $cl = @($sync.Clients)
     $on = @($cl | Where-Object { $_.status -eq 'connected' }).Count
-    $vrOn = 'off'
+    $vrOn = 'OFF'
     if ((Test-Path $VrFlagFile) -or (Test-Path $VrFlagAlt)) { $vrOn = 'ON' }
     $status.Text = ("RUNNING  |  SSID {0}  |  {1} device(s), {2} responsive  |  VR mode {3}" -f $tSsid.Text, $cl.Count, $on, $vrOn)
     $status.ForeColor = $BodyText
@@ -2080,6 +2681,11 @@ $form.Add_FormClosing({
     # Stop-Hotspot cannot re-enter tick handlers or a second close
     $script:Busy = $true
     $timer.Stop()
+    # persist the current settings (a Hotspot IP edit used to be lost
+    # when the user closed without starting)
+    $upName = [string]$cbUp.SelectedItem
+    if (-not $upName -or $upName -like '*(no uplink*') { $upName = '' }
+    try { Save-Settings $tSsid.Text $tPass.Text $upName ([bool]$cbRouter.Checked) ([bool]$cbVR.Checked) ([bool]$cbAuto.Checked) $tIp.Text.Trim() } catch { }
     if ($script:Running) { Stop-Hotspot }
     Stop-ClientScan
     Stop-DhcpServer
@@ -2104,6 +2710,17 @@ else {
     $cbVR.Checked = $true
 }
 $tPass.UseSystemPasswordChar = $true
+# hotspot IP: remembered setting or the 192.168.137.1 default. Applying
+# it here (before any start) also fixes $script:Subnet so reservation
+# suggestions and validation already use the chosen subnet.
+$ipCfg = '192.168.137.1'
+if ($cfg -and $cfg.serverIp) { $ipCfg = [string]$cfg.serverIp }
+$tIp.Text = $ipCfg
+[void](Update-ServerIPField $false)
+# ...and put the IP box into the right enable/disable state for the
+# loaded Router-mode setting (CheckedChanged does not fire on its own
+# when the saved value equals the default)
+Sync-RouterUI
 Refresh-Uplinks
 Refresh-ResvList
 
@@ -2111,12 +2728,18 @@ Refresh-ResvList
 if (Disable-VRMode) {
     Log 'Crash recovery: Wi-Fi scans had been left paused - resumed now.'
 }
+# same idea for the DHCP firewall rule: a crash would have left the
+# inbound UDP 67 allow-rule behind
+Disable-DhcpFirewallRule
 
 Log "Welcome to VR Hotspot Studio v$AppVersion."
 Log 'This hotspot uses Wi-Fi Direct (wlansvc), not the broken'
 Log 'Windows tethering stack - it works even though Settings cannot.'
 Log 'One hotspot per radio: stop MyPublicWiFi before starting this.'
 Log 'Tip: double-click a connected device to pin a static IP for it.'
+Log 'Tip: pick which device the graph follows from the Track list.'
+Log 'Tip: red bars are missed pings; the lower graph strip is the total'
+Log '     throughput of the whole hotspot (all devices).'
 if ($cfg -and $cfg.uplink -and $cbUp.Items.Contains($cfg.uplink)) { $cbUp.SelectedItem = $cfg.uplink }
 
 $form.Add_Shown({

@@ -44,6 +44,12 @@ That is it. The app needs no installation, no .NET downloads, no dependencies
   **per-MAC static IP reservations** - built for 3D printers and other
   devices that need a fixed address (see
   [docs/PRINTER-STATIC-IP.md](docs/PRINTER-STATIC-IP.md))
+- **Custom hotspot subnet** (Router mode): the **Hotspot IP** box accepts
+  any private /24 - `10.x.x.x`, `172.16-31.x.x`, `192.168.x.x` - so you
+  are no longer stuck on `192.168.137.x`. The app refuses to start on a
+  subnet that collides with your uplink, cleans leftover addresses off
+  the adapter, and skips reservations pinned to a different subnet
+  (with a log line telling you which)
 - **Connected-clients list** that actually stays live: a background
   tracker merges the ARP table, DHCP leases and a 1-per-second keepalive
   ping into one stable list (name / IP / MAC / status), so entries do not
@@ -58,10 +64,14 @@ That is it. The app needs no installation, no .NET downloads, no dependencies
 - **Adapter power saving is always disabled** while the hotspot runs - no
   toggle, by design (Realtek power saving causes micro-stutters)
 - **Auto-start on launch** (optional checkbox)
-- **Live latency graph** that works in both sharing modes and tracks any
-  device you choose: green filled line = milliseconds (with avg/max), red
-  bars = dropouts. Right-click a connected device and "Watch latency" to
-  aim the graph at it; by default it follows the first connected client
+- **Live latency + bandwidth graph** that works in both sharing modes:
+  the top strip is latency to the tracked device (teal filled line with
+  avg/max, red bars = dropouts), the bottom strip is live hotspot
+  throughput - **to devices** (amber area) and **from devices** (indigo
+  line) in Mbps with session totals from the adapter counters
+- **Pick the tracked device from the Track dropdown** (or right-click a
+  device -> "Watch latency"); by default the graph follows the first
+  connected client
 - **Click a device to pin a static IP**: double-click a connected device
   (or right-click it, or use the "Pin static IP" button) and the
   reservation dialog comes up pre-filled with its name, MAC and a
@@ -72,7 +82,9 @@ That is it. The app needs no installation, no .NET downloads, no dependencies
 - **Copy SSID+pass button** for the clipboard
 - **Live log** with band/channel display
 - **Redesigned dark UI**: flat cards, teal accents, status pill, responsive
-  window (no freezing during start/stop, scrolls on small screens)
+  window (no freezing during start/stop, scrolls on small screens), and
+  DPI-aware scaling - the layout renders correctly on 125-150% displays
+  and labels sit above their fields, so text never overlaps the boxes
 - No telemetry, no background services, nothing installed - close the
   window and everything is gone (settings are kept in two small files next
   to the scripts)
@@ -153,6 +165,24 @@ most common items:
 
 ## Version history
 
+- **v2.3.0** - your-subnet Router mode (any private /24, uplink-collision
+  guard, stale-address cleanup, per-subnet reservation filtering), the
+  latency card gained a visible **Track** dropdown and a live **bandwidth
+  strip** (to/from devices, Mbps + session totals), and the whole UI went
+  DPI-aware with labels above fields (fixes text overlapping input boxes
+  on 125-150% scaled displays). Validated by a 170-assertion suite
+  (parse, units incl. IP-validation and byte formatting, real loopback
+  DHCP incl. out-of-subnet reservation guards, simulated tracker
+  lifecycle incl. bandwidth sampling, real GDI+ drawing of both graph
+  zones, 10 s concurrency stress) plus a coordinate-level automated
+  layout audit (no control overlaps at 100%, 115% text scale and 150%
+  DPI). Hardened after a three-agent review (correctness 6->8, UX 7,
+  PS 5.1/security 7.5) plus a verification round: the reservation
+  subnet invariant is now enforced inside the DHCP server itself,
+  bandwidth sampling addresses the hidden WFD adapter by interface
+  index, Router mode fails fast (and cleans up VR mode) when the
+  adapter address cannot be set, the uplink-collision check is
+  prefix-aware, and IPs are canonicalized before use.
 - **v2.2.0** - device tracker rework: no more blinking entries on connect,
   the list keeps updating with VR mode on, latency graph works in Router
   mode too and survives power-saving clients (1 s / 1 s timeout pings that

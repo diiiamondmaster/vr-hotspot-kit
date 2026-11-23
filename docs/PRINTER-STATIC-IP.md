@@ -43,14 +43,23 @@ also connects to a router sometimes, give it a different static address there
 
 ## Which IP range?
 
-Both modes use `192.168.137.x`:
+Shared mode uses whatever Windows ICS assigns (`192.168.137.x` by
+default). Router mode defaults to the same but you can type any private
+/24 into the app's **Hotspot IP** box (`10.x.x.x`, `172.16-31.x.x`,
+`192.168.x.x`) - useful when `192.168.137.x` would collide with another
+network you use. The app refuses to start if the chosen subnet collides
+with your uplink. Whichever subnet you run, the layout is:
 
 | Address | Meaning |
 | --- | --- |
-| `192.168.137.1` | the PC (gateway + DHCP server) |
-| `192.168.137.2` - `.99` | ICS DHCP pool / general use |
-| `192.168.137.100` - `.200` | Router-mode DHCP pool |
-| `192.168.137.50` etc. | pick a fixed address outside the pool you use |
+| `<subnet>.1` | the PC (gateway + DHCP server) |
+| `<subnet>.2` - `.99` | ICS DHCP pool / general use |
+| `<subnet>.100` - `.200` | Router-mode DHCP pool |
+| `<subnet>.50` etc. | pick a fixed address outside the pool you use |
+
+Reservations pinned to a different subnet than the one the hotspot runs
+on are skipped (the start log says so) - re-pin them after changing the
+Hotspot IP.
 
 ## Finding the printer's MAC
 
