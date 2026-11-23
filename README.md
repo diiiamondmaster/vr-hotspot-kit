@@ -43,7 +43,20 @@ That is it. The app needs no installation, no .NET downloads, no dependencies
 - **Router mode** (advanced): the app runs its own NAT and DHCP server with
   **per-MAC static IP reservations** - built for 3D printers and other
   devices that need a fixed address (see
-  [docs/PRINTER-STATIC-IP.md](docs/PRINTER-STATIC-IP.md))
+  [docs/PRINTER-STATIC-IP.md](docs/PRINTER-STATIC-IP.md)). Hardened in
+  v2.9.0 after field reports put almost every remaining problem here:
+  the DHCP server now receives on a wildcard socket (a client's first
+  DISCOVER is a broadcast, and Windows only guarantees delivery to
+  wildcard-bound sockets - a specifically bound socket could miss every
+  knock, which looks exactly like "kicked off, password asked again"),
+  replies carry the right source IP through a dedicated send socket,
+  the Windows ICS service is sidelined for the session so its own DHCP
+  on port 67 cannot fight the built-in one, and a `[router]` watchdog
+  checks every ~15 s that the DHCP server, DNS relay, NAT, IP
+  forwarding, firewall rules and the hotspot's address are all still
+  alive - repairing any of them automatically (4 repairs per incident,
+  budget restored after 5 stable minutes) instead of telling you to
+  restart the hotspot
 - **Custom hotspot subnet** (Router mode): the **Hotspot IP** box accepts
   any private /24 - `10.x.x.x`, `172.16-31.x.x`, `192.168.x.x` - so you
   are no longer stuck on `192.168.137.x`. The app refuses to start on a
@@ -71,9 +84,14 @@ That is it. The app needs no installation, no .NET downloads, no dependencies
   app restarts the same hotspot automatically (3 attempts; the budget
   restores after 5 stable minutes), and system sleep is prevented while
   hosting - a sleeping PC looks exactly like a dead hotspot
-- **Built-in DNS relay** (Router mode, v2.6.0): clients use the hotspot
-  PC as their resolver; the relay forwards to public DNS from the host
-  side (works around uplinks that filter client DNS) and logs queries
+- **Built-in DNS relay** (Router mode, v2.6.0; parallel and compiled
+  since v2.9.0): clients use the hotspot PC as their resolver; the
+  relay forwards to public DNS from the host side (works around uplinks
+  that filter client DNS) and logs queries. It used to forward one
+  query at a time - a connecting phone's burst of lookups crawled for
+  seconds ("connected, no internet") - the relay is now a small C#
+  class with eight forwarding workers, so a whole burst is answered in
+  about one round trip
 - **"Test connection" on any device** (right-click): 3 pings plus TCP
   probes of ports 80 / 443 / 9100, all logged - tells ping-but-no-web-page
   apart from a dead device
@@ -205,6 +223,38 @@ most common items:
 
 ## Version history
 
+- **v2.9.0** - the Router mode reliability pass. Field reports put
+  almost every remaining problem in Router mode (Shared mode, where
+  Windows owns the plumbing, was stable), and four real defects
+  answered for it. The DHCP server's receive socket was bound to the
+  hotspot's own unicast address, but a client's first DISCOVER is a
+  **broadcast to 255.255.255.255:67, and Windows only guarantees
+  delivery of those to wildcard-bound sockets** - so on some stacks the
+  built-in DHCP never saw a knock at all: the device associated, never
+  got an address, gave up and dropped off, which reads from the outside
+  exactly like "kicked off, asks for the password again". The server
+  now receives on a wildcard socket with a per-interface filter
+  (`ReceiveMessageFrom`), replies through a second socket bound to the
+  hotspot address (correct source IP, correct egress adapter, unicast
+  renewals drained), retries binds instead of dying, and rebuilds a
+  dead reply socket. The **ICS service (SharedAccess) is now stopped
+  for the session** in Router mode: it hosts its own DHCP allocator on
+  UDP 67 and re-applies remembered bindings to adapters, and on the
+  stripped images this app targets the COM call that disables sharing
+  is often missing - so the service fought the built-in DHCP
+  mid-session (restored on stop, and the watchdog removes any foreign
+  address that appears on the hotspot adapter). The DNS relay was
+  rewritten as compiled C# with eight forwarding workers after a burst
+  of lookups proved it serialized (15 queries once relayed: 1). And a
+  `[router]` watchdog now checks all router-mode machinery every ~15 s
+  and **repairs it within a budget** instead of advising a hotspot
+  restart that would have dropped every connected client. STOP also
+  reverts IP forwarding (it used to outlive the hotspot on the uplink)
+  and restarts the ICS service if the app had stopped it. Test suite
+  grown to 213 assertions, including live loopback tests that exercise
+  the real DHCP source (DISCOVER/OFFER, renewal ACK, INIT-REBOOT NAK,
+  RELEASE, reservations) and the compiled DNS relay (parallel burst
+  forwarding, failure events, disarm).
 - **v2.8.0** - the keep-alive done the way the official sample does it.
   v2.7.0 moved the Wi-Fi Direct `ConnectionRequested` subscription into
   compiled C# (PowerShell 5.1 cannot subscribe WinRT events), but it

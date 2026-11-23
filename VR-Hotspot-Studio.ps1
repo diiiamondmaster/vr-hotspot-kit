@@ -1,6 +1,6 @@
 <#
 =====================================================================
- VR-Hotspot-Studio.ps1  v2.8.0
+ VR-Hotspot-Studio.ps1  v2.9.0
  A standalone Wi-Fi hotspot app that does NOT depend on the Windows
  Mobile Hotspot (icssvc/tethering) stack at all.
 
@@ -23,6 +23,43 @@
      subnet is YOUR choice now: any private /24 (10.x, 172.16-31.x,
      192.168.x) via the "Hotspot IP" box; a start-time check refuses
      subnets that collide with the uplink.
+
+v2.9.0 - the Router mode reliability pass. Field reports put
+   almost every remaining problem in Router mode (Shared mode, where
+   Windows owns the plumbing, was stable), and the router-mode code
+   had four real defects to answer for:
+   - DHCP receive was bound to the hotspot's own unicast address. A
+     client's first DISCOVER is a broadcast to 255.255.255.255:67, and
+     on Windows such datagrams are only guaranteed to reach
+     WILDCARD-bound sockets - so on some stacks the built-in DHCP never
+     saw a knock at all: the device associated, never got an address,
+     gave up and dropped off, which reads from the outside exactly
+     like "kicked off, asks for the password again". The server now
+     receives on a wildcard socket with a per-interface filter
+     (ReceiveMessageFrom), and replies from a second socket bound to
+     the hotspot address so source IP and egress adapter stay correct;
+     unicast renewals are drained too, binds retry instead of dying,
+     and a dead reply socket rebuilds itself.
+   - The ICS service (SharedAccess) kept running in Router mode. It
+     hosts its own DHCP allocator on UDP 67 and re-applies remembered
+     bindings to adapters; on stripped images the COM call that
+     disables sharing is often missing, so the service fought the
+     built-in DHCP mid-session. Router mode now stops it for the
+     session (restored on stop) and the watchdog removes any foreign
+     address that appears on the hotspot adapter.
+   - The DNS relay forwarded one query at a time, blocking up to 1.5 s
+     per resolver - a connecting phone's burst of lookups serialized
+     into seconds of "connected, no internet". The relay is now
+     compiled C# (VRhs.DnsRelay): one receive thread, every query
+     forwarded concurrently.
+   - A dead DHCP/DNS/NAT/forwarding/adapter-address was only reported
+     ("restart the hotspot", dropping every client with it). The
+     [router] watchdog now checks all of it every ~15 s and repairs
+     within a budget (4 per incident, restored after 5 stable
+     minutes). Every action is a [router] log line.
+   Also: STOP now reverts IP forwarding (it used to outlive the
+   hotspot on the uplink) and restarts the ICS service if the app had
+   stopped it.
 
 v2.8.0:
    - v2.7.0 still let clients drop. Its C# bridge only QUEUED each
@@ -196,7 +233,7 @@ v2.3.0:
 
 $ErrorActionPreference = 'Continue'
 $SelfTest   = ($env:VRHS_SELFTEST -eq '1')
-$AppVersion = '2.8.0'
+$AppVersion = '2.9.0'
 # v2.5.0 - alias guard (see the changelog at the top): `sc` is the
 # built-in alias of Set-Content and ALIASES OUTRANK FUNCTIONS in
 # command resolution, which is how the SC() helper got captured. The
@@ -217,6 +254,9 @@ $script:HasNetAdapter = [bool](Get-Command -Name Get-NetAdapter -ErrorAction Sil
 # Router mode also needs the NetTCPIP cmdlets (Get-/New-NetIPAddress,
 # New-NetNat); Shared mode does not. Detected once for the same reason.
 $script:HasNetTcpIp = [bool](Get-Command -Name Get-NetIPAddress -ErrorAction SilentlyContinue)
+# ... plus the NAT and firewall cmdlets the [router] watchdog repairs with
+$script:HasNetNat = [bool](Get-Command -Name Get-NetNat -ErrorAction SilentlyContinue)
+$script:HasNetFw  = [bool](Get-Command -Name Get-NetFirewallRule -ErrorAction SilentlyContinue)
 
 # =====================================================================
 # script location - MUST be resolved before anything that uses it
@@ -243,8 +283,12 @@ $script:ScanRun     = $null      # runspace for the client tracker
 $script:ScanHandle  = $null
 $script:WfdArmed    = $false     # keep-alive (C# WfdKeeper) armed
 $script:WfdLastBeat = $null      # last [wfd] heartbeat log time
-$script:DnsRun      = $null      # runspace for the DNS relay (router mode)
-$script:DnsHandle   = $null
+$script:FwdIfs        = @()       # router mode: ifIndexes forwarding was enabled on (reverted on stop)
+$script:IcsSvcStopped = $false    # router mode: we stopped SharedAccess this session
+$script:RouterWatchAt  = $null    # router mode: last [router] health check
+$script:RouterRepairCount = 0     # router-mode repairs used in this incident
+$script:RouterRepairAt  = $null   # when the last router-mode repair happened
+$script:RouterWarn     = $false   # router-mode service down + budget spent
 $script:LastStart   = $null      # params of the last successful start (auto-restart)
 $script:RestartCount = 0         # auto-restart attempts used in this incident
 $script:LastRestartAt = $null    # when the last auto-restart happened
@@ -255,9 +299,9 @@ $sync.Leases        = [hashtable]::Synchronized(@{})       # mac (colon) -> ip (
 $sync.LeaseList     = @()                                    # immutable lease snapshot published by the DHCP server
 $sync.Hostnames     = [hashtable]::Synchronized(@{})       # mac (colon) -> DHCP hostname (option 12)
 $sync.Reservations  = @{}                                   # macKey (bare) -> reserved ip
-$sync.Stop          = $false
-$sync.StopDns       = $false     # DNS relay loop control
+$sync.Stop          = $false     # DHCP server loop control
 $sync.DnsMode       = 'relay'    # 'relay' = hand out the hotspot PC as DNS
+$sync.DhcpIfIndex   = 0          # hotspot adapter ifIndex (DHCP receive filter)
 # client tracker state (written by the scan runspace, read by the GUI)
 $sync.Clients       = @()                                    # immutable snapshot published each cycle
 $sync.PingHist      = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
@@ -671,7 +715,9 @@ function Enable-IcsOnNames([string]$uplinkName, [string]$privateName) {
 #
 # Test hooks (defaults are the production values):
 #   $sync.DhcpPort / $sync.ClientPort  - UDP ports (67 / 68)
+#   $sync.DhcpTxPort                   - reply source bind port (default: DhcpPort)
 #   $sync.Broadcast                    - reply destination (255.255.255.255)
+#   $sync.DhcpIfIndex                  - receiving-interface filter (0 = any)
 # =====================================================================
 $DhcpSource = @'
 param($sync)
@@ -743,8 +789,10 @@ $subnet    = [string]$sync.Subnet
 $poolStart = 100; if ($sync.PoolStart) { $poolStart = [int]$sync.PoolStart }
 $poolEnd   = 200; if ($sync.PoolEnd)   { $poolEnd   = [int]$sync.PoolEnd }
 $port      = 67;   if ($sync.DhcpPort)  { $port  = [int]$sync.DhcpPort }
+$txport    = $port; if ($sync.DhcpTxPort) { $txport = [int]$sync.DhcpTxPort }
 $cport     = 68;   if ($sync.ClientPort){ $cport = [int]$sync.ClientPort }
 $bcast     = '255.255.255.255'; if ($sync.Broadcast) { $bcast = [string]$sync.Broadcast }
+$ifidx     = 0;   if ($sync.DhcpIfIndex) { $ifidx = [int]$sync.DhcpIfIndex }
 
 $leases = @{}     # mac (colon form) -> ip
 $offers = @{}     # mac (colon form) -> ip handed out in an OFFER, not yet ACKed
@@ -796,20 +844,165 @@ function Get-FreeIP([string]$macKey, [string]$macDisp) {
     return $null
 }
 
-try {
-    $udp = New-Object System.Net.Sockets.UdpClient
-    $udp.ExclusiveAddressUse = $false
-    $udp.Client.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::Socket, [System.Net.Sockets.SocketOptionName]::Broadcast, $true)
-    $udp.Client.Bind((New-Object System.Net.IPEndPoint ([System.Net.IPAddress]::Parse($ip), $port)))
-    $udp.Client.ReceiveTimeout = 700
-    Log "DHCP server listening on ${ip}:$port"
-} catch {
-    Log "DHCP bind FAILED: $($_.Exception.Message)"
-    try { $udp.Close() } catch { }
-    return
+# =====================================================================
+# sockets (v2.9.0 rework - the root of "router mode never gives anyone
+# an address"):
+#   RX binds the WILDCARD address (0.0.0.0:$port). Every client's first
+#   DISCOVER is a limited broadcast to 255.255.255.255:67, and on
+#   Windows such datagrams are only guaranteed to reach wildcard-bound
+#   sockets - the v2.8.0 socket was bound to the hotspot's own unicast
+#   address instead, so depending on the stack an OFFER could never be
+#   triggered at all: the device associated, got no address, gave up
+#   and de-associated - which from the outside is exactly "kicked off
+#   after a few minutes / asks for the password again".
+#   ReceiveMessageFrom reads the receiving interface index; packets
+#   from OTHER interfaces (a wired LAN's DHCP, a VPN subnet scan) are
+#   ignored so the server never answers DHCP that is not its business.
+#   Index 0 means "unknown" on some stacks - treated as a match.
+#   TX binds the hotspot's own address ($ip:$txport) so replies carry
+#   the right source IP (option 54 must match) and leave through the
+#   hotspot adapter rather than the default-route uplink. Unicast
+#   requests prefer the specifically bound socket on every observed
+#   stack, so TX is drained each pass: a renewing client never waits
+#   longer than one receive timeout.
+# =====================================================================
+function Bind-Sockets {
+    $script:rx = $null; $script:tx = $null
+    $r = New-Object System.Net.Sockets.UdpClient
+    $r.ExclusiveAddressUse = $false
+    $r.Client.Bind((New-Object System.Net.IPEndPoint ([System.Net.IPAddress]::Any, $port)))
+    $r.Client.ReceiveTimeout = 700
+    $script:rx = $r
+    $t = New-Object System.Net.Sockets.UdpClient
+    $t.ExclusiveAddressUse = $false
+    try { $t.Client.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::Socket, [System.Net.Sockets.SocketOptionName]::Broadcast, $true) } catch { }
+    $t.Client.Bind((New-Object System.Net.IPEndPoint ([System.Net.IPAddress]::Parse($ip), $txport)))
+    $script:tx = $t
 }
 
-$dst = New-Object System.Net.IPEndPoint ([System.Net.IPAddress]::Parse($bcast), $cport)
+$bindTries = 0
+$bound = $false
+while (-not $bound -and $bindTries -lt 10) {
+    try { Bind-Sockets; $bound = $true }
+    catch {
+        $bindTries++
+        if ($script:rx) { try { $script:rx.Close() } catch { } }
+        if ($script:tx) { try { $script:tx.Close() } catch { } }
+        $script:rx = $null; $script:tx = $null
+        if ($bindTries -eq 1) { Log "DHCP socket bind failed: $($_.Exception.Message) - retrying" }
+        Start-Sleep -Milliseconds 900
+    }
+}
+if (-not $bound) { Log 'DHCP server could not bind its sockets - giving up (report this line).'; return }
+Log "DHCP server listening on ${ip}:$port (broadcast-safe receive, replies from ${ip}:$txport)"
+
+# reply destination: broadcast, unless the client demonstrably receives
+# unicast (it wrote to us from its own address and did not set the DHCP
+# broadcast flag) - renewals then go straight back to it
+function Get-ReplyEp([byte[]]$req, $srcEp) {
+    $bcastFlag = (($req[10] -band 0x80) -ne 0)
+    $srcIp = [string]$srcEp.Address
+    if (-not $bcastFlag -and $srcIp -and $srcIp -ne '0.0.0.0' -and $srcIp -ne '255.255.255.255') {
+        return (New-Object System.Net.IPEndPoint ($srcEp.Address, $srcEp.Port))
+    }
+    return (New-Object System.Net.IPEndPoint ([System.Net.IPAddress]::Parse($bcast), $cport))
+}
+
+# send through the TX socket; if it died (adapter address flap, driver
+# reset) rebuild it once and retry - a send failure must not kill the
+# server for every later client
+function Send-Reply([byte[]]$data, $dstEp) {
+    for ($try = 1; $try -le 2; $try++) {
+        try { $tx.Send($data, $data.Length, $dstEp) | Out-Null; return $true }
+        catch {
+            if ($try -eq 2) { return $false }
+            try { $tx.Close() } catch { }
+            try {
+                $t = New-Object System.Net.Sockets.UdpClient
+                $t.ExclusiveAddressUse = $false
+                try { $t.Client.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::Socket, [System.Net.Sockets.SocketOptionName]::Broadcast, $true) } catch { }
+                $t.Client.Bind((New-Object System.Net.IPEndPoint ([System.Net.IPAddress]::Parse($ip), $txport)))
+                $script:tx = $t
+            } catch { return $false }
+        }
+    }
+    return $false
+}
+
+function Handle-Query([byte[]]$req, $srcEp) {
+    if ($req.Length -lt 240) { return }
+    if ($req[236] -ne 99 -or $req[237] -ne 130 -or $req[238] -ne 83 -or $req[239] -ne 99) { return }
+    $macDisp = MacStr $req[28..43]
+    $macKey  = MacKey $macDisp
+    $opts = Read-Options $req
+    $msgType = 0
+    if ($opts.ContainsKey(53) -and $opts[53].Count -ge 1) { $msgType = [int]$opts[53][0] }
+    $dstEp = Get-ReplyEp $req $srcEp
+
+    if ($msgType -eq 1) {
+        $offer = Get-FreeIP $macKey $macDisp
+        if ($offer) {
+            $offers[$macDisp] = $offer
+            $offerTime[$macDisp] = Get-Date
+            if (Send-Reply (New-Reply $req $offer 2 $ip) $dstEp) { Log "OFFER $offer to $macDisp" }
+            else { Log "OFFER send failed for $macDisp" }
+        } else { Log "POOL FULL - no address for $macDisp" }
+    }
+    elseif ($msgType -eq 3) {
+        # REQUEST -> ACK / NAK (silence if it is selecting another server)
+        $srvSel = OptStrIP $opts 54
+        if ($srvSel -and $srvSel -ne $ip) { return }
+        $wanted = OptStrIP $opts 50
+        if (-not $wanted -and ($req[12] -or $req[13] -or $req[14] -or $req[15])) {
+            $wanted = ('{0}.{1}.{2}.{3}' -f [int]$req[12], [int]$req[13], [int]$req[14], [int]$req[15])
+        }
+        $assigned = Get-FreeIP $macKey $macDisp
+        if ($assigned -and $wanted -eq $assigned) {
+            $leases[$macDisp] = $assigned
+            $sync.Leases[$macDisp] = $assigned
+            $leaseTime[$macDisp] = Get-Date
+            $offers.Remove($macDisp)
+            $offerTime.Remove($macDisp)
+            [void](Send-Reply (New-Reply $req $assigned 5 $ip) $dstEp)
+            $name = ''
+            if ($opts.ContainsKey(12) -and $opts[12].Count -gt 0) {
+                # the hostname is guest-controlled: strip anything that
+                # could forge log lines and cap its length
+                $name = [System.Text.Encoding]::ASCII.GetString($opts[12])
+                $name = ($name -replace '[^\x20-\x7E]', '').Trim()
+                if ($name.Length -gt 32) { $name = $name.Substring(0, 32) }
+            }
+            if ($name) { try { $sync.Hostnames[$macDisp] = $name } catch { } }
+            Log "ACK $assigned to $macDisp $name"
+            Publish-Leases
+        } else {
+            [void](Send-Reply (New-Reply $req '0.0.0.0' 6 $ip) $dstEp)
+            Log "NAK $macDisp (wanted $wanted, assigned $assigned)"
+        }
+    }
+    elseif ($msgType -eq 4) {
+        # DECLINE - the client found the address in use; drop it everywhere
+        $leases.Remove($macDisp)
+        $sync.Leases.Remove($macDisp)
+        $offers.Remove($macDisp)
+        $offerTime.Remove($macDisp)
+        Publish-Leases
+        Log "DECLINE $macDisp (address conflict reported - address returned to pool)"
+    }
+    elseif ($msgType -eq 7) {
+        # RELEASE
+        if ($leases.ContainsKey($macDisp)) {
+            $sync.Leases.Remove($macDisp)
+            $leases.Remove($macDisp)
+            $leaseTime.Remove($macDisp)
+            Publish-Leases
+            Log "RELEASE $macDisp"
+        }
+    }
+}
+
+$useRmf = $true
+$rbuf = New-Object byte[] 1500
 try {
     while (-not $sync.Stop) {
         # expire stale offers so a DISCOVER that was never followed by a
@@ -828,176 +1021,320 @@ try {
             }
         }
         if ($changed) { Publish-Leases }
-        $ep = New-Object System.Net.IPEndPoint ([System.Net.IPAddress]::Any, 0)
-        $req = $null
-        try { $req = $udp.Receive([ref]$ep) }
-        catch {
-            # a Receive timeout is the normal heartbeat; any other socket
-            # error must not spin the loop at 100% CPU
-            Start-Sleep -Milliseconds 50
-            continue
-        }
-        if ($null -eq $req -or $req.Length -lt 240) { continue }
-        if ($req[236] -ne 99 -or $req[237] -ne 130 -or $req[238] -ne 83 -or $req[239] -ne 99) { continue }
-        $macDisp = MacStr $req[28..43]
-        $macKey  = MacKey $macDisp
-        $opts = Read-Options $req
-        $msgType = 0
-        if ($opts.ContainsKey(53) -and $opts[53].Count -ge 1) { $msgType = [int]$opts[53][0] }
 
-        if ($msgType -eq 1) {
-            $offer = Get-FreeIP $macKey $macDisp
-            if ($offer) {
-                $offers[$macDisp] = $offer
-                $offerTime[$macDisp] = Get-Date
-                try { $udp.Send((New-Reply $req $offer 2 $ip), 300, $dst) | Out-Null; Log "OFFER $offer to $macDisp" }
-                catch { Log "OFFER send failed: $($_.Exception.Message)" }
-            } else { Log "POOL FULL - no address for $macDisp" }
-        }
-        elseif ($msgType -eq 3) {
-            # REQUEST -> ACK / NAK (silence if it is selecting another server)
-            $srvSel = OptStrIP $opts 54
-            if ($srvSel -and $srvSel -ne $ip) { continue }
-            $wanted = OptStrIP $opts 50
-            if (-not $wanted -and ($req[12] -or $req[13] -or $req[14] -or $req[15])) {
-                $wanted = ('{0}.{1}.{2}.{3}' -f [int]$req[12], [int]$req[13], [int]$req[14], [int]$req[15])
-            }
-            $assigned = Get-FreeIP $macKey $macDisp
-            if ($assigned -and $wanted -eq $assigned) {
-                $leases[$macDisp] = $assigned
-                $sync.Leases[$macDisp] = $assigned
-                $leaseTime[$macDisp] = Get-Date
-                $offers.Remove($macDisp)
-                $offerTime.Remove($macDisp)
-                try { $udp.Send((New-Reply $req $assigned 5 $ip), 300, $dst) | Out-Null } catch { }
-                $name = ''
-                if ($opts.ContainsKey(12) -and $opts[12].Count -gt 0) {
-                    # the hostname is guest-controlled: strip anything that
-                    # could forge log lines and cap its length
-                    $name = [System.Text.Encoding]::ASCII.GetString($opts[12])
-                    $name = ($name -replace '[^\x20-\x7E]', '').Trim()
-                    if ($name.Length -gt 32) { $name = $name.Substring(0, 32) }
+        # ---- broadcast path: wildcard RX (+ interface filter) --------
+        $ep = New-Object System.Net.IPEndPoint ([System.Net.IPAddress]::Any, 0)
+        try {
+            if ($useRmf) {
+                $flags = [System.Net.Sockets.SocketFlags]::None
+                $pktInfo = New-Object System.Net.Sockets.IPPacketInformation
+                $n = $rx.Client.ReceiveMessageFrom($rbuf, 0, $rbuf.Length, [ref]$flags, [ref]$ep, [ref]$pktInfo)
+                if ($n -gt 0) {
+                    $fromIf = [int]$pktInfo.Interface
+                    if ($fromIf -gt 0 -and $ifidx -gt 0 -and $fromIf -ne $ifidx) {
+                        # DHCP belonging to another interface (LAN, VPN)
+                    } else {
+                        Handle-Query @($rbuf[0..($n-1)]) $ep
+                    }
                 }
-                if ($name) { try { $sync.Hostnames[$macDisp] = $name } catch { } }
-                Log "ACK $assigned to $macDisp $name"
-                Publish-Leases
             } else {
-                try { $udp.Send((New-Reply $req '0.0.0.0' 6 $ip), 300, $dst) | Out-Null } catch { }
-                Log "NAK $macDisp (wanted $wanted, assigned $assigned)"
+                $req2 = $rx.Receive([ref]$ep)
+                if ($req2) { Handle-Query $req2 $ep }
             }
-        }
-        elseif ($msgType -eq 4) {
-            # DECLINE - the client found the address in use; drop it everywhere
-            $leases.Remove($macDisp)
-            $sync.Leases.Remove($macDisp)
-            $offers.Remove($macDisp)
-            $offerTime.Remove($macDisp)
-            Publish-Leases
-            Log "DECLINE $macDisp (address conflict reported - address returned to pool)"
-        }
-        elseif ($msgType -eq 7) {
-            # RELEASE
-            if ($leases.ContainsKey($macDisp)) {
-                $sync.Leases.Remove($macDisp)
-                $leases.Remove($macDisp)
-                $leaseTime.Remove($macDisp)
-                Publish-Leases
-                Log "RELEASE $macDisp"
+        } catch {
+            $timedOut = $false
+            try {
+                if ($_.Exception -is [System.Net.Sockets.SocketException] -and [string]$_.Exception.SocketErrorCode -eq 'TimedOut') { $timedOut = $true }
+            } catch { }
+            if (-not $timedOut) {
+                if ($useRmf) {
+                    # ReceiveMessageFrom unavailable on this stack - fall
+                    # back to plain receive (interface filter off)
+                    $useRmf = $false
+                    Log "ReceiveMessageFrom unavailable - plain receive in use: $($_.Exception.Message)"
+                }
+                Start-Sleep -Milliseconds 50
             }
+            # NO 'continue' here: a receive timeout must fall through to
+            # the TX drain below, or a unicast renewal waits in the TX
+            # buffer until some other client's broadcast happens to
+            # unblock the loop (v2.9.0 test-caught)
+        }
+
+        # ---- unicast path: renewals prefer the specific TX socket ----
+        for ($di = 0; $di -lt 8; $di++) {
+            $avail = 0
+            try { $avail = $tx.Available } catch { break }
+            if ($avail -le 0) { break }
+            $tep = New-Object System.Net.IPEndPoint ([System.Net.IPAddress]::Any, 0)
+            $treq = $null
+            try { $treq = $tx.Receive([ref]$tep) } catch { break }
+            if ($treq) { Handle-Query $treq $tep }
         }
     }
 } finally {
-    try { $udp.Close() } catch { }
+    if ($script:rx) { try { $script:rx.Close() } catch { } }
+    if ($script:tx) { try { $script:tx.Close() } catch { } }
 }
 Log "DHCP server stopped"
 '@
 
 # =====================================================================
-# DNS relay source (runs in a background runspace, Router mode).
-# Clients use the hotspot PC as their resolver; queries are forwarded
-# to public resolvers FROM THE HOST SIDE, which keeps name resolution
-# working even when the uplink filters UDP/53 traffic that originates
-# from NAT'ed clients, and gives the log a visible sign that traffic
-# flows. Falls back to handing out 1.1.1.1 / 8.8.8.8 directly when the
-# relay cannot bind (the DHCP server checks $sync.DnsMode live).
+# DNS relay (Router mode) - compiled C# since v2.9.0 (VRhs.DnsRelay).
+# The v2.8.0 relay was a PowerShell runspace that forwarded ONE query
+# at a time, blocking up to 1.5 s per upstream resolver: a connecting
+# phone fires dozens of lookups at once and they queued behind each
+# other, so resolution crawled exactly when someone was watching
+# ("connected, no internet"). The compiled relay receives on its own
+# thread and forwards every query CONCURRENTLY on threadpool threads;
+# PowerShell only starts/stops it and drains log strings - the same
+# shape as the Wi-Fi Direct keeper (VRhs.WfdKeeper). Option 6 in the
+# DHCP replies still points clients here first with 1.1.1.1 as the
+# secondary, and Start-DnsRelay flips $sync.DnsMode to 'direct' when
+# the bind fails, so no client is ever pointed at a dead resolver.
 # =====================================================================
-$DnsSource = @'
-param($sync)
-$ErrorActionPreference = 'Continue'
-function Log($t) { $sync.Log.Add("$(Get-Date -Format 'HH:mm:ss')  [dns] $t") | Out-Null }
+$DnsCs = @'
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Net;
+using System.Net.Sockets;
+using System.Threading;
 
-$ip = [string]$sync.ServerIP
-$upstreams = @('1.1.1.1', '8.8.8.8')
-if ($sync.DnsUpstreams) { $upstreams = @($sync.DnsUpstreams) }
-
-try {
-    $srv = New-Object System.Net.Sockets.UdpClient
-    $srv.ExclusiveAddressUse = $false
-    $srv.Client.Bind((New-Object System.Net.IPEndPoint ([System.Net.IPAddress]::Parse($ip), 53)))
-    $srv.Client.ReceiveTimeout = 700
-    Log "DNS relay listening on ${ip}:53"
-} catch {
-    Log "DNS relay could not bind: $($_.Exception.Message)"
-    Log '  clients fall back to direct 1.1.1.1 / 8.8.8.8 (picked up at the next DHCP lease)'
-    $sync.DnsMode = 'direct'
-    try { $srv.Close() } catch { }
-    return
-}
-
-$total = 0
-$fails  = 0
-while (-not $sync.StopDns) {
-    $ep = New-Object System.Net.IPEndPoint ([System.Net.IPAddress]::Any, 0)
-    $q = $null
-    try { $q = $srv.Receive([ref]$ep) }
-    catch {
-        # a Receive timeout is the normal heartbeat; any other socket
-        # error must not spin the loop at 100% CPU (same as the DHCP loop)
-        Start-Sleep -Milliseconds 50
-        continue
-    }
-    if ($null -eq $q -or $q.Length -lt 16) { continue }
-
-    # name of the first query, for the log only - best effort, never fatal
-    $qname = ''
-    try {
-        $p = 12; $parts = @()
-        while ($p -lt $q.Length -and $q[$p] -ne 0) {
-            $l = [int]$q[$p]
-            if ($l -le 0 -or ($p + 1 + $l) -gt $q.Length) { break }
-            $parts += [System.Text.Encoding]::ASCII.GetString($q, ($p + 1), $l)
-            $p += 1 + $l
+namespace VRhs
+{
+    // Parallel UDP DNS relay (Router mode). One dedicated thread
+    // receives client queries; every query is forwarded concurrently by
+    // one of eight dedicated worker threads to the first upstream
+    // resolver that answers (1.5 s cap each) and the reply is sent
+    // straight back to the client it came from. The whole object graph
+    // lives in compiled code because a PowerShell runspace executes one
+    // statement at a time - concurrency is the entire point of this
+    // class. (Workers, not the shared threadpool: a blocked pool thread
+    // is only replaced about twice a second on low-core machines, which
+    // once starved a 15-query burst down to one answer on the rig.)
+    public static class DnsRelay
+    {
+        private static readonly ConcurrentQueue<string> _events =
+            new ConcurrentQueue<string>();
+        private static readonly object _sendLock = new object();
+        private class Pending
+        {
+            public byte[] Q;
+            public IPEndPoint From;
         }
-        $qname = ($parts -join '.')
-    } catch { }
-    if ($qname.Length -gt 64) { $qname = $qname.Substring(0, 64) }
+        private static UdpClient _srv;
+        private static Thread _loop;
+        private static volatile bool _run;
+        private static IPEndPoint[] _ups;
+        private static long _total;
+        private static long _fails;
+        private static readonly ConcurrentQueue<Pending> _queue =
+            new ConcurrentQueue<Pending>();
+        private static List<Thread> _workers;
 
-    $rep = $null
-    foreach ($up in $upstreams) {
-        $c = $null
-        try {
-            $c = New-Object System.Net.Sockets.UdpClient
-            $c.Client.ReceiveTimeout = 1500
-            [void]$c.Send($q, $q.Length, $up, 53)
-            $from = New-Object System.Net.IPEndPoint ([System.Net.IPAddress]::Any, 0)
-            $rep = $c.Receive([ref]$from)
-        } catch { $rep = $null }
-        finally { if ($c) { try { $c.Close() } catch { } } }
-        if ($rep) { break }
-    }
-    if ($rep) {
-        try { [void]$srv.Send($rep, $rep.Length, $ep) } catch { }
-        $total++
-        # keep the log readable: the first five queries individually,
-        # then roughly one line per twenty
-        if ($total -le 5 -or ($total % 20) -eq 1) { Log "relaying DNS ($total queries so far, last: $qname)" }
-    }
-    elseif ($qname) {
-        $fails++
-        if ($fails -le 3 -or ($fails % 10) -eq 0) { Log "no answer from any resolver for $qname ($fails failures so far)" }
+        public static bool Arm(string serverIp, int port, string[] upstreams)
+        {
+            Disarm();
+            UdpClient s = null;
+            try
+            {
+                IPEndPoint bind = new IPEndPoint(IPAddress.Parse(serverIp), port);
+                s = new UdpClient(bind);
+                s.Client.ReceiveTimeout = 400;
+            }
+            catch (Exception ex)
+            {
+                if (s != null) { try { s.Close(); } catch { } }
+                _events.Enqueue("relay could not bind " + serverIp + ":" +
+                                port + ": " + ex.Message);
+                return false;
+            }
+            List<IPEndPoint> ups = new List<IPEndPoint>();
+            foreach (string u in upstreams)
+            {
+                if (u == null) { continue; }
+                try
+                {
+                    string hp = u.Trim();
+                    int p = 53;
+                    int c = hp.LastIndexOf(':');
+                    if (c > 0)
+                    {
+                        p = int.Parse(hp.Substring(c + 1));
+                        hp = hp.Substring(0, c);
+                    }
+                    ups.Add(new IPEndPoint(IPAddress.Parse(hp), p));
+                }
+                catch { }
+            }
+            if (ups.Count == 0)
+            {
+                try { s.Close(); } catch { }
+                _events.Enqueue("relay has no usable upstream resolver");
+                return false;
+            }
+            _ups = ups.ToArray();
+            _srv = s;
+            _run = true;
+            _total = 0;
+            _fails = 0;
+            _loop = new Thread(ReceiveLoop);
+            _loop.IsBackground = true;
+            _loop.Start();
+            // forwarding runs on DEDICATED worker threads, not the shared
+            // threadpool: a forwarded query blocks in Receive for up to
+            // 1.5 s per upstream, and on low-core machines the threadpool
+            // injects replacement threads only about twice a second, so a
+            // phone's burst of lookups stalls behind the first few
+            // (measured on the test rig: 15 queries, 1 answered). Eight
+            // cheap bounded workers are immune to pool starvation.
+            _workers = new List<Thread>();
+            for (int i = 0; i < 8; i++)
+            {
+                Thread w = new Thread(WorkerLoop);
+                w.IsBackground = true;
+                w.Start();
+                _workers.Add(w);
+            }
+            _events.Enqueue("relay listening on " + serverIp + ":" + port +
+                            " - forwarding to " + _ups.Length + " resolver(s)");
+            return true;
+        }
+
+        private static void ReceiveLoop()
+        {
+            UdpClient s = _srv;
+            while (_run && s != null)
+            {
+                IPEndPoint from = new IPEndPoint(IPAddress.Any, 0);
+                byte[] q = null;
+                try { q = s.Receive(ref from); }
+                catch (SocketException) { continue; }        // timeout / transient
+                catch (ObjectDisposedException) { return; }
+                catch { Thread.Sleep(50); continue; }
+                if (q == null || q.Length < 16) { continue; }
+                Pending p = new Pending();
+                p.Q = q;
+                p.From = from;
+                _queue.Enqueue(p);
+            }
+        }
+
+        private static void Forward(byte[] q, IPEndPoint from)
+        {
+            byte[] rep = null;
+            foreach (IPEndPoint up in _ups)
+            {
+                UdpClient c = null;
+                try
+                {
+                    c = new UdpClient();
+                    c.Client.ReceiveTimeout = 1500;
+                    c.Send(q, q.Length, up);
+                    IPEndPoint any = new IPEndPoint(IPAddress.Any, 0);
+                    rep = c.Receive(ref any);
+                }
+                catch { rep = null; }
+                finally { if (c != null) { try { c.Close(); } catch { } } }
+                if (rep != null) { break; }
+            }
+            if (rep != null)
+            {
+                lock (_sendLock)
+                {
+                    if (_run && _srv != null)
+                    {
+                        try { _srv.Send(rep, rep.Length, from); } catch { }
+                    }
+                }
+                long n = Interlocked.Increment(ref _total);
+                if (n <= 5 || (n % 20) == 1)
+                {
+                    _events.Enqueue("relaying DNS (" + n + " queries so far, last: " +
+                                    NameOf(q) + ")");
+                }
+            }
+            else
+            {
+                long n = Interlocked.Increment(ref _fails);
+                if (n <= 3 || (n % 10) == 0)
+                {
+                    _events.Enqueue("no answer from any resolver for " +
+                                    NameOf(q) + " (" + n + " failures so far)");
+                }
+            }
+        }
+
+        // name of the first question, for the log only - best effort
+        private static string NameOf(byte[] q)
+        {
+            try
+            {
+                int p = 12;
+                string all = "";
+                while (p < q.Length && q[p] != 0)
+                {
+                    int l = (int)q[p];
+                    if (l <= 0 || (p + 1 + l) > q.Length) { break; }
+                    if (all.Length > 0) { all += "."; }
+                    all += System.Text.Encoding.ASCII.GetString(q, p + 1, l);
+                    p += 1 + l;
+                }
+                if (all.Length > 64) { all = all.Substring(0, 64); }
+                return all;
+            }
+            catch { return ""; }
+        }
+
+        private static void WorkerLoop()
+        {
+            while (_run)
+            {
+                Pending p;
+                if (!_queue.TryDequeue(out p)) { Thread.Sleep(10); continue; }
+                Forward(p.Q, p.From);
+            }
+        }
+
+        // ---------- the small surface PowerShell is allowed to touch ----------
+
+        public static void Disarm()
+        {
+            _run = false;
+            UdpClient s = _srv;
+            _srv = null;
+            if (s != null) { try { s.Close(); } catch { } }
+            Thread l = _loop;
+            _loop = null;
+            if (l != null) { try { l.Join(1200); } catch { } }
+            List<Thread> ws = _workers;
+            _workers = null;
+            if (ws != null)
+            {
+                foreach (Thread w in ws) { try { w.Join(300); } catch { } }
+            }
+            string ev;
+            while (_events.TryDequeue(out ev)) { }
+        }
+
+        public static bool IsAlive()
+        {
+            Thread l = _loop;
+            return _run && l != null && l.IsAlive;
+        }
+
+        public static string TakeEvent()
+        {
+            string s;
+            return _events.TryDequeue(out s) ? s : null;
+        }
+
+        public static long QueryCount() { return Interlocked.Read(ref _total); }
+
+        public static long FailCount() { return Interlocked.Read(ref _fails); }
     }
 }
-try { $srv.Close() } catch { }
 '@
 
 # =====================================================================
@@ -1413,6 +1750,168 @@ function Enable-SrvFirewallRules {
 function Disable-SrvFirewallRules {
     try { netsh advfirewall firewall delete rule name="$DhcpFwRuleName" 2>&1 | Out-Null } catch { }
     try { netsh advfirewall firewall delete rule name="$DnsFwRuleName" 2>&1 | Out-Null } catch { }
+}
+
+# =====================================================================
+# Update-RouterHealth - the Router-mode watchdog (v2.9.0).
+#
+# Router mode is the app's own little router: a DHCP runspace, a DNS
+# relay, a NAT object, forwarding flags, firewall rules, one address
+# on the hotspot adapter and one Windows service parked out of the
+# way. Windows takes no offence at breaking any of those mid-session
+# (another app recreates the NAT, a group policy refresh drops the
+# firewall rules, the parked ICS service trigger-starts itself again,
+# sleep flaps the adapter address...). Through v2.8.0 a death was only
+# REPORTED ("restart the hotspot" - dropping every connected client
+# with it); the watchdog now checks every ~15 s and repairs within a
+# budget, so the normal failure mode is one [router] log line instead
+# of a broken hotspot. Budget: 4 repairs per incident, restored after
+# 5 stable minutes (same philosophy as the publisher self-healing).
+# =====================================================================
+function Update-RouterHealth {
+    if (-not $script:Running -or -not $sync.RouterMode) { return }
+    if (-not $script:RouterWatchAt) { $script:RouterWatchAt = Get-Date; return }
+    if (((Get-Date) - $script:RouterWatchAt).TotalSeconds -lt 15) { return }
+    $script:RouterWatchAt = Get-Date
+
+    if ($script:RouterRepairCount -gt 0 -and $script:RouterRepairAt -and ((Get-Date) - $script:RouterRepairAt).TotalMinutes -ge 5) {
+        $script:RouterRepairCount = 0
+        $script:RouterRepairAt = $null
+        Log '[router] five stable minutes - repair budget restored.'
+    }
+
+    $healthy = $true
+
+    # 1. DHCP server runspace alive? (dead = new devices get no address)
+    if ($script:DhcpHandle -and $script:DhcpHandle.IsCompleted) {
+        $healthy = $false
+        if ($script:RouterRepairCount -lt 4) {
+            $script:RouterRepairCount++
+            $script:RouterRepairAt = Get-Date
+            Log '[router] DHCP server died - restarting it.'
+            $script:Busy = $true
+            try { Start-DhcpServerRun } finally { $script:Busy = $false }
+            if ($script:DhcpHandle -and -not $script:DhcpHandle.IsCompleted) {
+                Log '[router] DHCP server restarted.'
+                $healthy = $true
+            } else {
+                Log '[router] DHCP server restart failed - the budget allows more attempts.'
+            }
+        }
+    }
+
+    # 2. DNS relay alive? (dead = name lookups crawl until clients fall
+    #    back to the secondary resolver handed out with the lease)
+    if ([string]$sync.DnsMode -eq 'relay') {
+        $dnsAlive = $false
+        $dnsT = 'VRhs.DnsRelay' -as [type]
+        if ($dnsT) { try { $dnsAlive = [VRhs.DnsRelay]::IsAlive() } catch { $dnsAlive = $false } }
+        if (-not $dnsAlive) {
+            $healthy = $false
+            if ($script:RouterRepairCount -lt 4) {
+                $script:RouterRepairCount++
+                $script:RouterRepairAt = Get-Date
+                Log '[router] DNS relay died - re-arming it.'
+                Start-DnsRelay
+                if ([string]$sync.DnsMode -ne 'relay') {
+                    Log '[router] DNS relay could not re-arm - new clients get 1.1.1.1 / 8.8.8.8 directly.'
+                } else {
+                    Log '[router] DNS relay re-armed.'
+                    $healthy = $true
+                }
+            }
+        }
+    }
+
+    # 3. hotspot adapter still owns our address? A foreign address (the
+    #    classic: ICS's 192.168.137.1) appearing mid-session is the
+    #    tug-of-war this watchdog exists to end
+    if ($script:HasNetTcpIp) {
+        $va = Get-WfdAdapter
+        if ($va) {
+            try {
+                $ips = @(Get-NetIPAddress -InterfaceIndex $va.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue)
+                $ours = @($ips | Where-Object { $_.IPAddress -eq $script:ServerIP })
+                if ($ours.Count -eq 0) {
+                    $healthy = $false
+                    if ($script:RouterRepairCount -lt 4) {
+                        $script:RouterRepairCount++
+                        $script:RouterRepairAt = Get-Date
+                        New-NetIPAddress -InterfaceIndex $va.InterfaceIndex -IPAddress $script:ServerIP -PrefixLength 24 -ErrorAction Stop | Out-Null
+                        Log "[router] hotspot address $($script:ServerIP) was removed - re-applied."
+                        $healthy = $true
+                    }
+                }
+                foreach ($f in @($ips | Where-Object { $_.IPAddress -notlike '169.254.*' -and $_.IPAddress -notlike "$($script:Subnet).*" })) {
+                    try {
+                        Remove-NetIPAddress -IPAddress $f.IPAddress -InterfaceIndex $va.InterfaceIndex -Confirm:$false -ErrorAction Stop | Out-Null
+                        Log "[router] foreign address $($f.IPAddress) removed from the hotspot adapter (ICS re-grab?)."
+                    } catch { }
+                }
+            } catch { }
+        }
+    }
+
+    # 4. NAT still present?
+    if ($script:HasNetNat) {
+        try {
+            if (-not (Get-NetNat -Name VRHotspotNAT -ErrorAction SilentlyContinue)) {
+                $healthy = $false
+                if ($script:RouterRepairCount -lt 4) {
+                    $script:RouterRepairCount++
+                    $script:RouterRepairAt = Get-Date
+                    New-NetNat -Name VRHotspotNAT -InternalIPInterfaceAddressPrefix "$($script:Subnet).0/24" -ErrorAction Stop | Out-Null
+                    Log '[router] NAT disappeared - recreated.'
+                    $healthy = $true
+                }
+            }
+        } catch { Log "[router] NAT recreation failed: $($_.Exception.Message)" }
+    }
+
+    # 5. forwarding still on for the interfaces that needed enabling?
+    if ($script:HasNetTcpIp) {
+        foreach ($fi in @($script:FwdIfs)) {
+            try {
+                $ipif = @(Get-NetIPInterface -InterfaceIndex $fi -AddressFamily IPv4 -ErrorAction SilentlyContinue)
+                if ($ipif.Count -gt 0 -and [string]$ipif[0].Forwarding -ne 'Enabled') {
+                    Set-NetIPInterface -InterfaceIndex $fi -Forwarding Enabled -ErrorAction SilentlyContinue
+                    Log "[router] IP forwarding re-enabled on interface $fi."
+                }
+            } catch { }
+        }
+    }
+
+    # 6. firewall rules still present?
+    if ($script:HasNetFw) {
+        try {
+            if (@(Get-NetFirewallRule -DisplayName $DhcpFwRuleName -ErrorAction SilentlyContinue).Count -eq 0) {
+                Enable-SrvFirewallRules
+                Log '[router] firewall rules re-added (UDP 67 / 53).'
+            }
+        } catch { }
+    }
+
+    # 7. the ICS service we parked must STAY parked (it is
+    #    trigger-started and can come back on its own)
+    try {
+        $svc = Get-Service -Name SharedAccess -ErrorAction SilentlyContinue
+        if ($svc -and [string]$svc.Status -eq 'Running') {
+            Stop-Service -Name SharedAccess -Force -ErrorAction SilentlyContinue
+            Log '[router] the ICS service came back mid-session - stopped again.'
+        }
+    } catch { }
+
+    if (-not $healthy) {
+        if (-not $script:RouterWarn) {
+            $script:RouterWarn = $true
+            Log '[router] a router-mode service is down and the repair budget is spent.'
+            Log '  Restart the hotspot (STOP + START) to recover it fully.'
+        }
+    }
+    elseif ($script:RouterWarn) {
+        $script:RouterWarn = $false
+        Log '[router] all router-mode services are healthy again.'
+    }
 }
 
 # =====================================================================
@@ -1834,18 +2333,116 @@ namespace VRhs
 }
 
 # =====================================================================
-# DNS relay start/stop (Router mode)
+# DNS relay lifecycle (Router mode) - the relay itself is the compiled
+# VRhs.DnsRelay class; these start/stop it and own the 'direct'
+# fallback when the bind fails (the DHCP server reads $sync.DnsMode
+# LIVE, at reply time, so a downgrade applies to the next lease).
 # =====================================================================
-function Stop-DnsServer {
-    $sync.StopDns = $true
-    if ($script:DnsHandle) {
-        $deadline = (Get-Date).AddSeconds(2)
-        while (-not $script:DnsHandle.IsCompleted -and (Get-Date) -lt $deadline) { Invoke-UIPump 100 }
-        try { $script:DnsRun.Stop() } catch { }
-        try { $script:DnsRun.Dispose() } catch { }
-        $script:DnsRun = $null; $script:DnsHandle = $null
+function Compile-DnsRelay {
+    $have = 'VRhs.DnsRelay' -as [type]
+    if ($have) { return $true }
+    try {
+        Add-Type -TypeDefinition $script:DnsCs -Language CSharp -ErrorAction Stop | Out-Null
+    } catch {
+        try {
+            Add-Type -TypeDefinition $script:DnsCs -ReferencedAssemblies @('System') -Language CSharp -ErrorAction Stop | Out-Null
+        } catch {
+            Log 'DNS relay could not be compiled.'
+            Log ("  compiler said: {0}" -f $_.Exception.Message)
+            return $false
+        }
     }
+    return $true
 }
+
+function Start-DnsRelay {
+    Stop-DnsRelay
+    if ($SelfTest) { return }
+    if (-not (Compile-DnsRelay)) { $sync.DnsMode = 'direct'; return }
+    $ok = $false
+    try { $ok = [VRhs.DnsRelay]::Arm([string]$sync.ServerIP, 53, [string[]]@('1.1.1.1', '8.8.8.8')) }
+    catch {
+        Log "DNS relay could not start: $($_.Exception.Message)"
+        $sync.DnsMode = 'direct'
+        Log '  clients get 1.1.1.1 / 8.8.8.8 directly (applies at the next DHCP lease).'
+        return
+    }
+    if (-not $ok) {
+        for ($i = 0; $i -lt 10; $i++) {
+            $ev = $null
+            try { $ev = [VRhs.DnsRelay]::TakeEvent() } catch { $ev = $null }
+            if (-not $ev) { break }
+            Log "[dns] $ev"
+        }
+        $sync.DnsMode = 'direct'
+        Log 'DNS relay could not bind - clients fall back to direct 1.1.1.1 / 8.8.8.8.'
+        return
+    }
+    $sync.DnsMode = 'relay'
+    Log 'DNS relay armed: queries forwarded in parallel by compiled C#'
+}
+
+function Stop-DnsRelay {
+    $t = 'VRhs.DnsRelay' -as [type]
+    if ($t) { try { [VRhs.DnsRelay]::Disarm() } catch { } }
+}
+
+# =====================================================================
+# (re)start the DHCP server runspace with the $sync settings already in
+# place - used at hotspot start and by the [router] watchdog when the
+# server dies mid-session (a restart drops nobody; a "restart the
+# hotspot" advice drops every connected client).
+# =====================================================================
+function Start-DhcpServerRun {
+    Stop-DhcpServer
+    $sync.Stop = $false
+    $script:DhcpRun = [powershell]::Create().AddScript($DhcpSource).AddArgument($sync)
+    $script:DhcpHandle = $script:DhcpRun.BeginInvoke()
+}
+
+# =====================================================================
+# Router mode vs the ICS service (SharedAccess): the service hosts its
+# own DHCP allocator on UDP 67 and re-applies remembered bindings to
+# adapters. Disable-AllIcs clears current bindings through the COM API,
+# but on stripped images that API is often missing - and a running
+# SharedAccess then fights the app's built-in DHCP for port 67 and the
+# hotspot adapter mid-session (clients suddenly see 192.168.137.x
+# offers or lose their gateway). Router mode stops the service for the
+# session; Stop-Hotspot starts it again if it was running before.
+# =====================================================================
+function Suspend-IcsService {
+    $script:IcsSvcStopped = $false
+    try {
+        $svc = Get-Service -Name SharedAccess -ErrorAction Stop
+        if ([string]$svc.Status -eq 'Running') {
+            Stop-Service -Name SharedAccess -Force -ErrorAction Stop
+            $script:IcsSvcStopped = $true
+            Log 'Router mode: ICS service (SharedAccess) stopped for this session.'
+            Log '  It runs its own DHCP on port 67 and would fight the built-in one.'
+        }
+    } catch { Log "Router mode: could not stop the ICS service: $($_.Exception.Message)" }
+}
+
+function Resume-IcsService {
+    if (-not $script:IcsSvcStopped) { return }
+    $script:IcsSvcStopped = $false
+    try { Start-Service -Name SharedAccess -ErrorAction SilentlyContinue } catch { }
+}
+
+# =====================================================================
+# Router mode enables IP forwarding on the uplink and the hotspot
+# adapter; until v2.9.0 that setting outlived the hotspot (left
+# Enabled on the uplink after STOP, subtly changing the host's own
+# routing). Start remembers WHICH interfaces actually needed the
+# change; this puts them back.
+# =====================================================================
+function Disable-RouterForwarding {
+    foreach ($fi in @($script:FwdIfs)) {
+        try { Set-NetIPInterface -InterfaceIndex $fi -Forwarding Disabled -ErrorAction SilentlyContinue } catch { }
+    }
+    $script:FwdIfs = @()
+}
+
 
 # =====================================================================
 # start / stop logic
@@ -2008,6 +2605,11 @@ function Start-Hotspot {
     # 3a. router mode: own NAT + own DHCP with reservations
     if ($routerMode) {
         Disable-AllIcs
+        # the ICS service itself must go away for this session (own DHCP
+        # allocator on UDP 67, remembered bindings it re-applies to the
+        # adapter; with the COM API missing - normal on stripped images -
+        # Disable-AllIcs cannot fully clear that). Restored on stop.
+        Suspend-IcsService
         try {
             # drop leftover addresses from earlier sessions (e.g. an ICS
             # 192.168.137.1) so only the chosen subnet lives on the adapter
@@ -2059,19 +2661,35 @@ function Start-Hotspot {
         }
         try {
             $up = Get-NetAdapter -Name $uplinkName -ErrorAction Stop
-            Set-NetIPInterface -InterfaceIndex $up.InterfaceIndex -Forwarding Enabled -ErrorAction SilentlyContinue
-            Set-NetIPInterface -InterfaceIndex $script:VAdapter.InterfaceIndex -Forwarding Enabled -ErrorAction SilentlyContinue
+            # remember which interfaces actually NEEDED the change so
+            # Stop-Hotspot can revert exactly those (forwarding that
+            # outlives the hotspot subtly changes the host's routing)
+            $script:FwdIfs = @()
+            foreach ($fi in @($up.InterfaceIndex, $script:VAdapter.InterfaceIndex)) {
+                $was = $null
+                try {
+                    $ipif = @(Get-NetIPInterface -InterfaceIndex $fi -AddressFamily IPv4 -ErrorAction SilentlyContinue)
+                    if ($ipif.Count -gt 0) { $was = [string]$ipif[0].Forwarding }
+                } catch { }
+                if ($was -ne 'Enabled') {
+                    Set-NetIPInterface -InterfaceIndex $fi -Forwarding Enabled -ErrorAction SilentlyContinue
+                    $script:FwdIfs += $fi
+                }
+            }
             Log "IP forwarding enabled on uplink + hotspot"
         } catch { Log "Forwarding setup: $($_.Exception.Message)" }
 
-        # start the DHCP server runspace (reservations sync live afterwards)
+        # start the DHCP server run (reservations sync live afterwards)
         Stop-DhcpServer
         $sync.Leases.Clear()
         $sync.LeaseList = @()
-        $sync.Stop      = $false
         $sync.Subnet    = $script:Subnet
         $sync.ServerIP  = $script:ServerIP
         $sync.PoolStart = 100; $sync.PoolEnd = 200
+        # the DHCP receive socket only answers packets that arrive on
+        # the hotspot adapter (this ifIndex is re-asserted by the
+        # [router] watchdog after any adapter recreation)
+        $sync.DhcpIfIndex = $script:VAdapter.InterfaceIndex
         $rv = Get-Reservations
         # only reservations inside the ACTIVE subnet can be honored -
         # anything else would hand the client an address it cannot use
@@ -2080,19 +2698,12 @@ function Start-Hotspot {
         foreach ($r in $rvOk) { $h[(Norm-Mac $r.mac)] = $r.ip }
         $sync.Reservations = $h
         Enable-SrvFirewallRules
-        # DNS relay first: if its bind fails it flips DnsMode to 'direct'
-        # BEFORE the DHCP server hands out option 6, so no client can be
-        # pointed at a resolver that never came up
-        Stop-DnsServer
-        $sync.StopDns = $false
-        $sync.DnsMode = 'relay'
-        $script:DnsRun = [powershell]::Create().AddScript($DnsSource).AddArgument($sync)
-        $script:DnsHandle = $script:DnsRun.BeginInvoke()
-        $script:DnsDeadLogged = $false
-        Invoke-UIPump 300
-        $script:DhcpRun = [powershell]::Create().AddScript($DhcpSource).AddArgument($sync)
-        $script:DhcpHandle = $script:DhcpRun.BeginInvoke()
-        $script:DhcpDeadLogged = $false
+        # DNS relay first (compiled C#, parallel forwarding): if its bind
+        # fails it flips DnsMode to 'direct' BEFORE the DHCP server hands
+        # out option 6, so no client can be pointed at a resolver that
+        # never came up
+        Start-DnsRelay
+        Start-DhcpServerRun
         Log "Built-in DHCP started with $($rvOk.Count) reservation(s)"
         foreach ($r in $rvOk) { Log "  static: $($r.name)  $($r.mac)  -> $($r.ip)" }
         foreach ($r in @($rv | Where-Object { $_.ip -notlike "$($script:Subnet).*" })) {
@@ -2101,6 +2712,11 @@ function Start-Hotspot {
         if ($rv.Count -eq 0) {
             Log '  (no reservations yet - connect a device and double-click it to pin one)'
         }
+        # fresh [router] watchdog state for this session
+        $script:RouterWatchAt = $null
+        $script:RouterRepairCount = 0
+        $script:RouterRepairAt = $null
+        $script:RouterWarn = $false
     }
     # 3b. shared mode: ICS
     else {
@@ -2166,8 +2782,10 @@ function Stop-Hotspot {
     Stop-ClientScan
     Stop-WfdKeeper
     Stop-DhcpServer
-    Stop-DnsServer
+    Stop-DnsRelay
     Disable-SrvFirewallRules
+    Disable-RouterForwarding
+    Resume-IcsService
     try { Get-NetNat -Name VRHotspotNAT -ErrorAction SilentlyContinue | Remove-NetNat -Confirm:$false } catch { }
     try { Disable-AllIcs } catch { }
     try { Disable-VRMode | Out-Null } catch { }
@@ -3019,8 +3637,9 @@ $script:Busy         = $false
 $script:ClosePending = $false
 $script:SparkIdle    = $false
 $script:ScanDeadLogged = $false
-$script:DhcpDeadLogged = $false
-$script:DnsDeadLogged = $false
+$script:RouterWatchAt  = $null
+$script:RouterRepairCount = 0
+$script:RouterWarn     = $false
 # graph target picker state
 $script:TrackByText  = @{}
 $script:TrackLastKey = $null    # $null (not '') so the FIRST tick always
@@ -3512,25 +4131,12 @@ $timer.Add_Tick({
         return
     }
 
-    # ---- DHCP server liveness (Router mode): clients silently getting
-    # no address is the worst failure mode - surface it on the spot ----
-    if ($script:Running -and $sync.RouterMode -and $script:DhcpHandle -and $script:DhcpHandle.IsCompleted -and -not $script:DhcpDeadLogged) {
-        $script:DhcpDeadLogged = $true
-        Log 'DHCP server stopped unexpectedly - new devices will not get an address.'
-        Log 'Restart the hotspot to restore address assignment.'
-        $status.Text = 'WARNING: DHCP server died - restart the hotspot.'
-        $status.ForeColor = $Red
-    }
-
-    # ---- DNS relay liveness (Router mode) ----
-    # DnsMode 'direct' means the relay stepped aside ON PURPOSE at bind time
-    # (clients were handed 1.1.1.1 directly) - that is not a death to report
-    if ($script:Running -and $sync.RouterMode -and [string]$sync.DnsMode -eq 'relay' -and $script:DnsHandle -and $script:DnsHandle.IsCompleted -and -not $script:DnsDeadLogged) {
-        $script:DnsDeadLogged = $true
-        Log 'DNS relay stopped unexpectedly - new name lookups may fail.'
-        $status.Text = 'WARNING: DNS relay died - clients may lose name resolution.'
-        $status.ForeColor = $Red
-    }
+    # ---- router-mode services (v2.9.0): checked and REPAIRED every
+    # ~15 s, not just reported - a dead DHCP server, DNS relay, NAT,
+    # forwarding rule or adapter address is exactly what made Router
+    # mode feel flaky while Shared mode (where Windows owns all of
+    # that) did not
+    Update-RouterHealth
 
     # ---- publisher health (v2.6.0: self-healing) ----
     if ($script:Pub) {
@@ -3613,6 +4219,22 @@ $timer.Add_Tick({
         }
     }
 
+    # ---- DNS relay log lines (Router mode; the relay itself is
+    # compiled C# - the GUI only drains its event queue, same as the
+    # WFD keeper). DnsMode 'direct' means the relay stepped aside on
+    # purpose at bind time - nothing to drain then.
+    if ($sync.RouterMode -and [string]$sync.DnsMode -eq 'relay') {
+        $dnsT = 'VRhs.DnsRelay' -as [type]
+        if ($dnsT) {
+            for ($qi = 0; $qi -lt 10; $qi++) {
+                $dev = $null
+                try { $dev = [VRhs.DnsRelay]::TakeEvent() } catch { $dev = $null }
+                if (-not $dev) { break }
+                Log "[dns] $dev"
+            }
+        }
+    }
+
     # ---- device list + latency/bandwidth graph (both sharing modes) ----
     Render-Clients
     Draw-Sparkline
@@ -3622,7 +4244,7 @@ $timer.Add_Tick({
     $on = @($cl | Where-Object { $_.status -eq 'connected' }).Count
     $vrOn = 'OFF'
     if ((Test-Path $VrFlagFile) -or (Test-Path $VrFlagAlt)) { $vrOn = 'ON' }
-    if (-not $script:ScanDeadLogged -and -not $script:DhcpDeadLogged -and -not $script:DnsDeadLogged) {
+    if (-not $script:ScanDeadLogged -and -not $script:RouterWarn) {
         $held = 0
         try { $held = [VRhs.WfdKeeper]::HeldCount() } catch { }
         $status.Text = ("RUNNING  |  SSID {0}  |  {1} device(s), {2} responsive  |  keep-alive {3}  |  VR mode {4}" -f $tSsid.Text, $cl.Count, $on, $held, $vrOn)
@@ -3656,7 +4278,9 @@ $form.Add_FormClosing({
     if ($script:Running) { Stop-Hotspot }
     Stop-ClientScan
     Stop-DhcpServer
-    Stop-DnsServer
+    Stop-DnsRelay
+    Disable-RouterForwarding
+    Resume-IcsService
     Stop-WfdKeeper
     $script:LastStart = $null
     try { Set-KeepAwake $false } catch { }

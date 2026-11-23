@@ -116,6 +116,38 @@ radio is busy. In order:
 One radio can hold exactly one hotspot - this is a hardware constraint, not
 a bug.
 
+### Router mode was flaky / devices lost their address after a while
+Fixed at the root in v2.9.0 - four separate defects, all Router-mode
+only, which is why Shared mode looked fine while Router mode did not:
+
+1. **The DHCP receive socket was bound to the hotspot's own unicast
+   address.** A client's very first DISCOVER is a broadcast to
+   `255.255.255.255:67`, and on Windows such datagrams are only
+   guaranteed to reach *wildcard-bound* sockets - so depending on the
+   stack, the built-in DHCP never saw the client knock: it associated,
+   got no address, gave up and dropped off ("kicked off, asks for the
+   password again"). The server now receives on a wildcard socket with
+   a per-interface filter and replies through a socket bound to the
+   hotspot address.
+2. **The ICS service (SharedAccess) kept running** and its own DHCP
+   allocator fought the built-in one for port 67 and the hotspot
+   adapter mid-session - especially on stripped images where the COM
+   API that disables sharing is missing. Router mode now stops the
+   service for the session (restored on stop) and removes any foreign
+   address that shows up on the hotspot adapter.
+3. **The DNS relay forwarded one query at a time** (up to 1.5 s per
+   resolver), so a connecting phone's burst of lookups crawled. It is
+   now compiled C# with eight forwarding workers.
+4. **Dead machinery was only reported.** A `[router]` watchdog now
+   checks the DHCP server, DNS relay, NAT, IP forwarding, firewall
+   rules and the hotspot address every ~15 s and repairs them within a
+   budget (4 per incident, restored after 5 stable minutes) instead of
+   advising a hotspot restart that would drop every client.
+
+If Router mode ever misbehaves again, look for (and report) the
+`[router]` log lines - they name exactly which piece was repaired or
+failed - plus the `[dhcp]` / `[dns]` lines around the same timestamp.
+
 ### Devices connect but have no internet
 - Check the **uplink** dropdown picked the adapter that actually has internet
   (the one connected to `ALPCC_Public` or your router).
@@ -128,7 +160,11 @@ a bug.
   v2.6.0 also lists other NAT instances at start (WSL / Docker / Hyper-V
   create their own) - Windows supports exactly ONE NAT network, so a
   competing instance typically means internet sharing will not work until
-  it is removed.
+  it is removed. Since v2.9.0 the `[router]` watchdog recreates the NAT
+  itself when Windows loses it mid-session (watch for "[router] NAT
+  disappeared - recreated"), and "Router mode: ICS service (SharedAccess)
+  stopped for this session" in the log is normal - the service runs its
+  own DHCP on port 67 and would fight the built-in one.
 - **DNS check:** since v2.6.0 the log shows `[dns] relaying DNS (...)`
   lines while clients resolve names through the hotspot PC (the first
   five queries individually, then roughly one line per twenty). Queries
