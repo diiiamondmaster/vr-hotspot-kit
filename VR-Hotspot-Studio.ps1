@@ -1,6 +1,6 @@
 <#
 =====================================================================
- VR-Hotspot-Studio.ps1  v2.5.0
+ VR-Hotspot-Studio.ps1  v2.6.0
  A standalone Wi-Fi hotspot app that does NOT depend on the Windows
  Mobile Hotspot (icssvc/tethering) stack at all.
 
@@ -23,6 +23,40 @@
      subnet is YOUR choice now: any private /24 (10.x, 172.16-31.x,
      192.168.x) via the "Hotspot IP" box; a start-time check refuses
      subnets that collide with the uplink.
+
+v2.6.0:
+   - The "kicked off after a few minutes" bug, fixed at the root. A
+     Wi-Fi Direct access point must hold a WiFiDirectDevice session
+     for every connected client; without one Windows silently drops
+     each client roughly two minutes after it connects (printers,
+     headsets, anything), and some clients then refuse to rejoin
+     until the password is retyped. The app now runs a
+     WiFiDirectConnectionListener, accepts every client and holds
+     its session for as long as the hotspot runs ("keep-alive" -
+     the count is in the status line, one [wfd] log line per
+     client).
+   - Self-healing: if the publisher still dies, the app restarts
+     the same hotspot automatically (up to 3 attempts; the budget
+     restores after 5 stable minutes) instead of just marking it
+     LOST.
+   - System sleep is prevented while the hotspot runs
+     (SetThreadExecutionState - the display may still turn off). A
+     sleeping host looked exactly like "everything got kicked".
+   - Physical-adapter power saving is now disabled BEFORE the
+     access point starts and with a real adapter reset, so the
+     setting actually applies (drivers ignore -NoRestart changes
+     until the next reset).
+   - Router mode: clients get the hotspot PC as their DNS server -
+     a built-in relay forwards to 1.1.1.1 / 8.8.8.8 from the host
+     side and logs queries; it falls back to direct resolvers when
+     it cannot bind. NAT startup lists other NAT instances (WSL /
+     Docker / Hyper-V occupy the single NAT slot Windows provides),
+     and a crashed session's leftover NAT is removed on launch.
+   - Latency pings carry an explicit 1200 ms timeout and the wait
+     window grew to 2 s (fewer false red dropout bars). Right-click
+     a device for "Test connection": 3 pings plus TCP probes of
+     ports 80 / 443 / 9100, all logged - for printers whose web
+     page will not load although ping works.
 
 v2.5.0:
    - The startup freeze, fixed at the root (diagnosed from
@@ -124,7 +158,7 @@ v2.3.0:
 
 $ErrorActionPreference = 'Continue'
 $SelfTest   = ($env:VRHS_SELFTEST -eq '1')
-$AppVersion = '2.5.0'
+$AppVersion = '2.6.0'
 # v2.5.0 - alias guard (see the changelog at the top): `sc` is the
 # built-in alias of Set-Content and ALIASES OUTRANK FUNCTIONS in
 # command resolution, which is how the SC() helper got captured. The
@@ -169,6 +203,14 @@ $script:DhcpHandle  = $null
 $script:ResvCache   = $null      # reservations loaded from CSV
 $script:ScanRun     = $null      # runspace for the client tracker
 $script:ScanHandle  = $null
+$script:WfdListener = $null      # WiFiDirectConnectionListener (client keep-alive)
+$script:WfdArmed    = $false     # keep-alive event subscription active
+$script:DnsRun      = $null      # runspace for the DNS relay (router mode)
+$script:DnsHandle   = $null
+$script:LastStart   = $null      # params of the last successful start (auto-restart)
+$script:RestartCount = 0         # auto-restart attempts used in this incident
+$script:LastRestartAt = $null    # when the last auto-restart happened
+$script:KeepAwakeType = $null    # SetThreadExecutionState P/Invoke compiled?
 $sync               = [hashtable]::Synchronized(@{})
 $sync.Log           = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
 $sync.Leases        = [hashtable]::Synchronized(@{})       # mac (colon) -> ip (DHCP server writes)
@@ -176,6 +218,10 @@ $sync.LeaseList     = @()                                    # immutable lease s
 $sync.Hostnames     = [hashtable]::Synchronized(@{})       # mac (colon) -> DHCP hostname (option 12)
 $sync.Reservations  = @{}                                   # macKey (bare) -> reserved ip
 $sync.Stop          = $false
+$sync.StopDns       = $false     # DNS relay loop control
+$sync.DnsMode       = 'relay'    # 'relay' = hand out the hotspot PC as DNS
+$sync.WfdDevices    = [hashtable]::Synchronized(@{})   # held client sessions (keep-alive)
+$sync.WfdNames      = [hashtable]::Synchronized(@{})   # held client id -> display name (logging)
 # client tracker state (written by the scan runspace, read by the GUI)
 $sync.Clients       = @()                                    # immutable snapshot published each cycle
 $sync.PingHist      = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
@@ -453,11 +499,43 @@ function Get-PhysicalWifi {
         Where-Object { $_.PhysicalMediaType -like '*802.11*' } | Select-Object -First 1
 }
 
-function Disable-AdapterPowerSaving([string]$name) {
+function Disable-AdapterPowerSaving([string]$name, [bool]$restart) {
     try {
-        Disable-NetAdapterPowerManagement -Name $name -NoRestart -ErrorAction Stop | Out-Null
+        # skip the (adapter-resetting) call when power saving is
+        # already off - an idle reset would blip the uplink for nothing
+        $need = $true
+        try {
+            $pm = Get-NetAdapterPowerManagement -Name $name -ErrorAction Stop
+            if ($pm -and ([string]$pm.AllowComputerToTurnOffDevice -eq 'Disabled')) { $need = $false }
+        } catch { }
+        if (-not $need) { Log "Power saving already off on '$name'"; return }
+        if ($restart) {
+            Log "Resetting adapter '$name' so the power-saving change applies (the uplink may blip for a few seconds)"
+            Disable-NetAdapterPowerManagement -Name $name -ErrorAction Stop | Out-Null
+        }
+        else { Disable-NetAdapterPowerManagement -Name $name -NoRestart -ErrorAction Stop | Out-Null }
         Log "Power saving disabled on '$name' (always off in this app, by design)"
     } catch { Log "Could not disable power saving on '$name': $($_.Exception.Message)" }
+}
+
+# While the hotspot runs the system must not sleep - a sleeping host is
+# a dead hotspot and looks exactly like "every device got kicked off".
+# ES_CONTINUOUS | ES_SYSTEM_REQUIRED keeps the CPU/radio awake while the
+# display may still turn off (VR use wants exactly that). Runs on the GUI
+# thread, which is the thread that starts and stops the hotspot.
+function Set-KeepAwake([bool]$on) {
+    if ($SelfTest) { return }
+    if ($null -eq $script:KeepAwakeType) {
+        try {
+            Add-Type -MemberDefinition '[DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint esFlags);' -Name KeepAwake -Namespace VRhs -ErrorAction Stop | Out-Null
+            $script:KeepAwakeType = $true
+        } catch { $script:KeepAwakeType = $false; Log 'Could not engage sleep prevention - the system may sleep while hosting.' }
+    }
+    if (-not $script:KeepAwakeType) { return }
+    try {
+        if ($on) { [void][VRhs.KeepAwake]::SetThreadExecutionState(0x80000001) }
+        else { [void][VRhs.KeepAwake]::SetThreadExecutionState(0x80000000) }
+    } catch { }
 }
 
 # Keeps the UI alive while the main thread waits. In the GUI this
@@ -612,7 +690,11 @@ function New-Reply([byte[]]$req, [string]$yiaddr, [int]$msgType, [string]$srvIp)
     $o.Add(59); $o.Add(4); foreach ($b in [BitConverter]::GetBytes([System.Net.IPAddress]::HostToNetworkOrder([int]37800))) { $o.Add($b) }
     $o.Add(1);  $o.Add(4); foreach ($b in (IPBytes '255.255.255.0')) { $o.Add($b) }
     $o.Add(3);  $o.Add(4); foreach ($b in $m) { $o.Add($b) }
-    $dns = @(IPBytes '1.1.1.1') + @(IPBytes '8.8.8.8')
+    # option 6: DNS - the app's own relay while it runs (it logs queries
+    # and works even when the uplink filters client-originated DNS),
+    # direct public resolvers as the fallback
+    if ([string]$sync.DnsMode -eq 'relay') { $dns = @(IPBytes $srvIp) + @(IPBytes '1.1.1.1') }
+    else { $dns = @(IPBytes '1.1.1.1') + @(IPBytes '8.8.8.8') }
     $o.Add(6);  $o.Add($dns.Count); foreach ($b in $dns) { $o.Add($b) }
     $o.Add(255)
     $arr = $o.ToArray()
@@ -795,6 +877,94 @@ Log "DHCP server stopped"
 '@
 
 # =====================================================================
+# DNS relay source (runs in a background runspace, Router mode).
+# Clients use the hotspot PC as their resolver; queries are forwarded
+# to public resolvers FROM THE HOST SIDE, which keeps name resolution
+# working even when the uplink filters UDP/53 traffic that originates
+# from NAT'ed clients, and gives the log a visible sign that traffic
+# flows. Falls back to handing out 1.1.1.1 / 8.8.8.8 directly when the
+# relay cannot bind (the DHCP server checks $sync.DnsMode live).
+# =====================================================================
+$DnsSource = @'
+param($sync)
+$ErrorActionPreference = 'Continue'
+function Log($t) { $sync.Log.Add("$(Get-Date -Format 'HH:mm:ss')  [dns] $t") | Out-Null }
+
+$ip = [string]$sync.ServerIP
+$upstreams = @('1.1.1.1', '8.8.8.8')
+if ($sync.DnsUpstreams) { $upstreams = @($sync.DnsUpstreams) }
+
+try {
+    $srv = New-Object System.Net.Sockets.UdpClient
+    $srv.ExclusiveAddressUse = $false
+    $srv.Client.Bind((New-Object System.Net.IPEndPoint ([System.Net.IPAddress]::Parse($ip), 53)))
+    $srv.Client.ReceiveTimeout = 700
+    Log "DNS relay listening on ${ip}:53"
+} catch {
+    Log "DNS relay could not bind: $($_.Exception.Message)"
+    Log '  clients fall back to direct 1.1.1.1 / 8.8.8.8 (picked up at the next DHCP lease)'
+    $sync.DnsMode = 'direct'
+    try { $srv.Close() } catch { }
+    return
+}
+
+$total = 0
+$fails  = 0
+while (-not $sync.StopDns) {
+    $ep = New-Object System.Net.IPEndPoint ([System.Net.IPAddress]::Any, 0)
+    $q = $null
+    try { $q = $srv.Receive([ref]$ep) }
+    catch {
+        # a Receive timeout is the normal heartbeat; any other socket
+        # error must not spin the loop at 100% CPU (same as the DHCP loop)
+        Start-Sleep -Milliseconds 50
+        continue
+    }
+    if ($null -eq $q -or $q.Length -lt 16) { continue }
+
+    # name of the first query, for the log only - best effort, never fatal
+    $qname = ''
+    try {
+        $p = 12; $parts = @()
+        while ($p -lt $q.Length -and $q[$p] -ne 0) {
+            $l = [int]$q[$p]
+            if ($l -le 0 -or ($p + 1 + $l) -gt $q.Length) { break }
+            $parts += [System.Text.Encoding]::ASCII.GetString($q, ($p + 1), $l)
+            $p += 1 + $l
+        }
+        $qname = ($parts -join '.')
+    } catch { }
+    if ($qname.Length -gt 64) { $qname = $qname.Substring(0, 64) }
+
+    $rep = $null
+    foreach ($up in $upstreams) {
+        $c = $null
+        try {
+            $c = New-Object System.Net.Sockets.UdpClient
+            $c.Client.ReceiveTimeout = 1500
+            [void]$c.Send($q, $q.Length, $up, 53)
+            $from = New-Object System.Net.IPEndPoint ([System.Net.IPAddress]::Any, 0)
+            $rep = $c.Receive([ref]$from)
+        } catch { $rep = $null }
+        finally { if ($c) { try { $c.Close() } catch { } } }
+        if ($rep) { break }
+    }
+    if ($rep) {
+        try { [void]$srv.Send($rep, $rep.Length, $ep) } catch { }
+        $total++
+        # keep the log readable: the first five queries individually,
+        # then roughly one line per twenty
+        if ($total -le 5 -or ($total % 20) -eq 1) { Log "relaying DNS ($total queries so far, last: $qname)" }
+    }
+    elseif ($qname) {
+        $fails++
+        if ($fails -le 3 -or ($fails % 10) -eq 0) { Log "no answer from any resolver for $qname ($fails failures so far)" }
+    }
+}
+try { $srv.Close() } catch { }
+'@
+
+# =====================================================================
 # client tracker source (runs in a background runspace)
 #
 # Why this exists (v2.1.0 problems it replaces):
@@ -957,13 +1127,13 @@ while (-not $sync.StopScan) {
         else {
             try {
                 $p = New-Object System.Net.NetworkInformation.Ping
-                $tasks += @{ ping = $p; task = $p.SendPingAsync($e.ip); entry = $e }
+                $tasks += @{ ping = $p; task = $p.SendPingAsync($e.ip, 1200); entry = $e }
             } catch { $e.lastMs = -1 }
         }
     }
     if (@($tasks).Count -gt 0) {
         $tarr = @($tasks | ForEach-Object { $_.task })
-        try { [void][System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]$tarr, 1200) } catch { }
+        try { [void][System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]$tarr, 2000) } catch { }
         foreach ($t in $tasks) {
             $e = $t.entry
             $ok = $false
@@ -1180,24 +1350,157 @@ function Stop-ClientScan {
 }
 
 # =====================================================================
-# firewall rule for the built-in DHCP server (router mode).
+# firewall rules for the built-in servers (Router mode).
 # Windows Firewall's default inbound policy would silently swallow the
-# clients' DHCPDISCOVER broadcasts before they reach our UDP socket.
-# Scoped to inbound UDP 67, added on start, removed on stop.
+# clients' DHCPDISCOVER broadcasts (UDP 67) and DNS queries (UDP 53)
+# before they reach our sockets. Added on start, removed on stop.
 # =====================================================================
 $DhcpFwRuleName = 'VR Hotspot Studio DHCP'
+$DnsFwRuleName  = 'VR Hotspot Studio DNS'
 
-function Enable-DhcpFirewallRule {
+function Enable-SrvFirewallRules {
     try {
         netsh advfirewall firewall delete rule name="$DhcpFwRuleName" 2>&1 | Out-Null
         $out = netsh advfirewall firewall add rule name="$DhcpFwRuleName" dir=in action=allow protocol=UDP localport=67 2>&1
         if ("$out" -match 'Ok|determinato|OK') { Log 'Firewall: inbound UDP 67 allowed for the built-in DHCP server' }
         else { Log "Firewall rule could not be added - if devices fail to get an IP, allow UDP 67 manually. ($out)" }
+        netsh advfirewall firewall delete rule name="$DnsFwRuleName" 2>&1 | Out-Null
+        $out2 = netsh advfirewall firewall add rule name="$DnsFwRuleName" dir=in action=allow protocol=UDP localport=53 2>&1
+        if ("$out2" -match 'Ok|determinato|OK') { Log 'Firewall: inbound UDP 53 allowed for the built-in DNS relay' }
+        else { Log "DNS firewall rule could not be added - if names fail to resolve, allow UDP 53 manually. ($out2)" }
     } catch { Log "Firewall rule could not be added: $($_.Exception.Message)" }
 }
 
-function Disable-DhcpFirewallRule {
+function Disable-SrvFirewallRules {
     try { netsh advfirewall firewall delete rule name="$DhcpFwRuleName" 2>&1 | Out-Null } catch { }
+    try { netsh advfirewall firewall delete rule name="$DnsFwRuleName" 2>&1 | Out-Null } catch { }
+}
+
+# =====================================================================
+# client keep-alive - THE v2.6.0 fix. A Wi-Fi Direct access point must
+# hold a WiFiDirectDevice session for every connected client; if nobody
+# accepts the connection, Windows drops the client about two minutes
+# after it associates (known Wi-Fi Direct behavior - widely reported,
+# e.g. StackOverflow question 65009169 - and exactly
+# the "kicked off after a few minutes / password asked again" report).
+# A WiFiDirectConnectionListener receives one ConnectionRequested event
+# per client (legacy WPA2 stations included); the handler accepts it
+# with WiFiDirectDevice.FromIdAsync and PARKS the device object in
+# $sync.WfdDevices. The reference is what keeps the link alive - it is
+# released when the client goes (the GUI tick disposes disconnected
+# entries) or when the hotspot stops.
+# =====================================================================
+function Start-WfdKeeper {
+    Stop-WfdKeeper
+    if ($SelfTest) { return }
+    # cache the closed generic AsTask binder for IAsyncOperation<WiFiDirectDevice>
+    $global:VRhsWfdAsTask = $null
+    try {
+        $m = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+            $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
+            $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+        })
+        if (@($m).Count -gt 0) {
+            $global:VRhsWfdAsTask = $m[0].MakeGenericMethod([Windows.Devices.WiFiDirect.WiFiDirectDevice,Windows.Devices.WiFiDirect,ContentType=WindowsRuntime])
+        }
+    } catch { $global:VRhsWfdAsTask = $null }
+    if (-not $global:VRhsWfdAsTask) {
+        Log 'Client keep-alive could not be armed: the WinRT async binder is missing.'
+        Log '  devices may be dropped after ~2 minutes - report this line.'
+        return
+    }
+    $global:VRhsSync = $sync
+    try {
+        $script:WfdListener = New-Object Windows.Devices.WiFiDirect.WiFiDirectConnectionListener
+    } catch {
+        Log "Client keep-alive: listener could not be created: $($_.Exception.Message)"
+        $script:WfdListener = $null
+        return
+    }
+    try {
+        $null = Register-ObjectEvent -InputObject $script:WfdListener -EventName ConnectionRequested -SourceIdentifier VRhsWfdKeeper -Action {
+            $s  = $global:VRhsSync
+            $mi = $global:VRhsWfdAsTask
+            if (-not $s -or -not $mi) { return }
+            $ea = $null
+            try { $ea = $Event.SourceEventArgs } catch { }
+            if (-not $ea) { try { $ea = $args[1] } catch { } }
+            if (-not $ea) { return }
+            $id = ''; $nm = ''
+            try {
+                $req = $ea.GetConnectionRequest()
+                $id  = [string]$req.DeviceInformation.Id
+                $nm  = [string]$req.DeviceInformation.Name
+                try { $req.Dispose() } catch { }
+            } catch {
+                try { $s.Log.Add("$(Get-Date -Format 'HH:mm:ss')  [wfd] connection request could not be read: $($_.Exception.Message)") | Out-Null } catch { }
+                return
+            }
+            if (-not $id) { return }
+            if ($s.WfdDevices.ContainsKey($id)) { return }
+            # engine event actions are drained on the GUI thread, so the
+            # waits are capped tightly: the happy path is milliseconds,
+            # the worst case ~5 s once per flaky client
+            $dev = $null
+            $err = ''
+            for ($attempt = 1; $attempt -le 2 -and -not $dev; $attempt++) {
+                try {
+                    $op = [Windows.Devices.WiFiDirect.WiFiDirectDevice,Windows.Devices.WiFiDirect,ContentType=WindowsRuntime]::FromIdAsync($id)
+                    $tk = $mi.Invoke($null, @($op))
+                    if (-not $tk.Wait(2500)) { throw 'accept timed out' }
+                    $dev = $tk.Result
+                } catch { $err = $_.Exception.Message; if ($attempt -eq 1) { Start-Sleep -Milliseconds 300 } }
+            }
+            if ($dev) {
+                $s.WfdDevices[$id] = $dev
+                $s.WfdNames[$id] = $nm
+                try { $s.Log.Add("$(Get-Date -Format 'HH:mm:ss')  [wfd] client accepted and held open: $nm") | Out-Null } catch { }
+            }
+            else {
+                try { $s.Log.Add("$(Get-Date -Format 'HH:mm:ss')  [wfd] could not accept $nm : $err") | Out-Null } catch { }
+            }
+        }
+        $script:WfdArmed = $true
+        Log 'Client keep-alive armed: every client gets a held Wi-Fi Direct session'
+        Log '  (without it Windows drops Wi-Fi Direct clients after about two minutes)'
+    } catch {
+        Log "Client keep-alive could not be armed: $($_.Exception.Message)"
+        Log '  devices may be dropped after ~2 minutes - report this line.'
+        try { Unregister-Event -SourceIdentifier VRhsWfdKeeper -ErrorAction SilentlyContinue } catch { }
+        $script:WfdListener = $null
+        $script:WfdArmed = $false
+    }
+}
+
+function Stop-WfdKeeper {
+    if ($script:WfdArmed) {
+        try { Unregister-Event -SourceIdentifier VRhsWfdKeeper -ErrorAction SilentlyContinue } catch { }
+        try { Get-Job -Name 'VRhsWfdKeeper*' -ErrorAction SilentlyContinue | Remove-Job -Force -ErrorAction SilentlyContinue } catch { }
+    }
+    # also disarms stragglers: an action queued before the unregister
+    # finds no binder and no-ops instead of parking a dead session
+    $global:VRhsWfdAsTask = $null
+    foreach ($k in @($sync.WfdDevices.Keys)) {
+        try { $sync.WfdDevices[$k].Dispose() } catch { }
+    }
+    $sync.WfdDevices.Clear()
+    $sync.WfdNames.Clear()
+    $script:WfdListener = $null
+    $script:WfdArmed = $false
+}
+
+# =====================================================================
+# DNS relay start/stop (Router mode)
+# =====================================================================
+function Stop-DnsServer {
+    $sync.StopDns = $true
+    if ($script:DnsHandle) {
+        $deadline = (Get-Date).AddSeconds(2)
+        while (-not $script:DnsHandle.IsCompleted -and (Get-Date) -lt $deadline) { Invoke-UIPump 100 }
+        try { $script:DnsRun.Stop() } catch { }
+        try { $script:DnsRun.Dispose() } catch { }
+        $script:DnsRun = $null; $script:DnsHandle = $null
+    }
 }
 
 # =====================================================================
@@ -1274,6 +1577,15 @@ function Start-Hotspot {
         }
     }
 
+    # 0c. physical-adapter power saving off BEFORE the access point starts,
+    # this time with a real adapter reset so the setting actually applies:
+    # v2.5.0 used -NoRestart, which many drivers only honor after the next
+    # adapter reset - a radio that dozes mid-session is one of the ways
+    # clients get dropped. The uplink may blip for a few seconds here;
+    # that happens before the hotspot exists, so nothing is lost.
+    $physWifi0 = Get-PhysicalWifi
+    if ($physWifi0) { Disable-AdapterPowerSaving $physWifi0.Name $true }
+
     # 1. create the Wi-Fi Direct publisher
     try {
         $script:Pub = New-Object Windows.Devices.WiFiDirect.WiFiDirectAdvertisementPublisher
@@ -1289,12 +1601,18 @@ function Start-Hotspot {
         return $false
     }
 
+    # 1b. arm the client keep-alive BEFORE the access point exists, so no
+    # client can associate before the app is ready to hold its session
+    # open (the fix for the ~2-minute disconnects - see Start-WfdKeeper)
+    Start-WfdKeeper
+
     # 2. start it and wait for the virtual adapter (pumping the UI so
     #    the window stays responsive - v2.1.0 froze for up to 15 s here)
     try { $script:Pub.Start() }
     catch {
         Log "Publisher could not be started: $($_.Exception.Message)"
         $script:Pub = $null
+        Stop-WfdKeeper
         return $false
     }
     Log "Publisher starting..."
@@ -1313,6 +1631,7 @@ function Start-Hotspot {
         Log "Access point never came up. Status: $($script:Pub.Status)"
         try { $script:Pub.Stop() } catch { }
         $script:Pub = $null
+        Stop-WfdKeeper
         return $false
     }
     Log "Access point is UP on adapter: $($script:VAdapter.InterfaceDescription)"
@@ -1329,10 +1648,10 @@ function Start-Hotspot {
     }
     Log "Band follows uplink: currently $bandLine channel $chanLine (5 GHz requires a 5 GHz uplink)"
 
-    # power saving off on both adapters - always, by design
-    $physWifi = Get-PhysicalWifi
-    if ($physWifi) { Disable-AdapterPowerSaving $physWifi.Name }
-    if ($script:VAdapter) { Disable-AdapterPowerSaving $script:VAdapter.Name }
+    # power saving off on the hotspot's virtual adapter - by design. (The
+    # physical adapter was already handled before the publisher started,
+    # with a real adapter reset so the setting takes effect.)
+    if ($script:VAdapter) { Disable-AdapterPowerSaving $script:VAdapter.Name $false }
     if ($vrMode) { Enable-VRMode }
 
     # runtime subnet: Router mode uses the configured one; Shared mode
@@ -1374,13 +1693,25 @@ function Start-Hotspot {
             try { Disable-VRMode | Out-Null } catch { }
             try { $script:Pub.Stop() } catch { }
             $script:Pub = $null
+            Stop-WfdKeeper
             return $false
         }
         try {
+            # Windows supports exactly ONE internal NAT prefix per host.
+            # WSL2 / Docker / Hyper-V NAT instances occupy that slot - list
+            # them so the failure mode is visible instead of mysterious.
+            $others = @(Get-NetNat -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'VRHotspotNAT' })
+            if ($others.Count -gt 0) {
+                Log "Note: other NAT instances exist on this system: $(($others | ForEach-Object { $_.Name }) -join ', ')"
+                Log '  Windows allows only ONE NAT network - internet sharing may not work while they exist.'
+            }
             if (Get-NetNat -Name VRHotspotNAT -ErrorAction SilentlyContinue) { Remove-NetNat -Name VRHotspotNAT -Confirm:$false }
             New-NetNat -Name VRHotspotNAT -InternalIPInterfaceAddressPrefix "$($script:Subnet).0/24" -ErrorAction Stop | Out-Null
             Log "NAT created ($($script:Subnet).0/24)"
-        } catch { Log "NAT creation failed: $($_.Exception.Message) - internet sharing may not work" }
+        } catch {
+            Log "NAT creation failed: $($_.Exception.Message) - internet sharing will not work."
+            Log '  If other NAT instances were listed above (WSL / Docker / Hyper-V), they occupy the single NAT slot Windows provides.'
+        }
         try {
             $up = Get-NetAdapter -Name $uplinkName -ErrorAction Stop
             Set-NetIPInterface -InterfaceIndex $up.InterfaceIndex -Forwarding Enabled -ErrorAction SilentlyContinue
@@ -1403,10 +1734,20 @@ function Start-Hotspot {
         $h = @{}
         foreach ($r in $rvOk) { $h[(Norm-Mac $r.mac)] = $r.ip }
         $sync.Reservations = $h
+        Enable-SrvFirewallRules
+        # DNS relay first: if its bind fails it flips DnsMode to 'direct'
+        # BEFORE the DHCP server hands out option 6, so no client can be
+        # pointed at a resolver that never came up
+        Stop-DnsServer
+        $sync.StopDns = $false
+        $sync.DnsMode = 'relay'
+        $script:DnsRun = [powershell]::Create().AddScript($DnsSource).AddArgument($sync)
+        $script:DnsHandle = $script:DnsRun.BeginInvoke()
+        $script:DnsDeadLogged = $false
+        Invoke-UIPump 300
         $script:DhcpRun = [powershell]::Create().AddScript($DhcpSource).AddArgument($sync)
         $script:DhcpHandle = $script:DhcpRun.BeginInvoke()
         $script:DhcpDeadLogged = $false
-        Enable-DhcpFirewallRule
         Log "Built-in DHCP started with $($rvOk.Count) reservation(s)"
         foreach ($r in $rvOk) { Log "  static: $($r.name)  $($r.mac)  -> $($r.ip)" }
         foreach ($r in @($rv | Where-Object { $_.ip -notlike "$($script:Subnet).*" })) {
@@ -1467,13 +1808,21 @@ function Start-Hotspot {
     $sync.GraceRemove = 0
     $sync.Sim         = $false
     Start-ClientScan
+    # v2.6.0: a sleeping host is a dead hotspot - keep the system awake
+    # while hosting (the display may still turn off)
+    Set-KeepAwake $true
+    # remember how this hotspot was launched so the self-healing path can
+    # bring the exact same one back if the publisher ever dies
+    $script:LastStart = @{ ssid = $ssid; pass = $pass; uplink = $uplinkName; router = $routerMode; vr = $vrMode }
     return $true
 }
 
 function Stop-Hotspot {
     Stop-ClientScan
+    Stop-WfdKeeper
     Stop-DhcpServer
-    Disable-DhcpFirewallRule
+    Stop-DnsServer
+    Disable-SrvFirewallRules
     try { Get-NetNat -Name VRHotspotNAT -ErrorAction SilentlyContinue | Remove-NetNat -Confirm:$false } catch { }
     try { Disable-AllIcs } catch { }
     try { Disable-VRMode | Out-Null } catch { }
@@ -1488,6 +1837,7 @@ function Stop-Hotspot {
             Invoke-UIPump 150
         }
     }
+    Set-KeepAwake $false
     $script:Pub = $null; $script:VAdapter = $null
     $sync.Leases.Clear()
     $sync.LeaseList = @()
@@ -2325,6 +2675,7 @@ $script:ClosePending = $false
 $script:SparkIdle    = $false
 $script:ScanDeadLogged = $false
 $script:DhcpDeadLogged = $false
+$script:DnsDeadLogged = $false
 # graph target picker state
 $script:TrackByText  = @{}
 $script:TrackLastKey = $null    # $null (not '') so the FIRST tick always
@@ -2401,6 +2752,9 @@ function Invoke-StartHotspot {
         $ok = Start-Hotspot -ssid $tSsid.Text -pass $tPass.Text -uplinkName $uplink -routerMode ([bool]$cbRouter.Checked) -vrMode ([bool]$cbVR.Checked)
         $script:Running = $ok
         if ($ok) {
+            # a user-initiated start (re)fills the self-healing budget
+            $script:RestartCount = 0
+            $script:LastRestartAt = $null
             Set-Pill 'RUNNING' $Green
             $status.Text = "RUNNING  -  SSID '$($tSsid.Text)'"
             $status.ForeColor = $BodyText
@@ -2437,6 +2791,8 @@ function Invoke-StopHotspot {
     try {
         Stop-Hotspot
         $script:Running = $false
+        # an intentional stop must not be undone by the self-healing path
+        $script:LastStart = $null
         Set-Pill 'IDLE' $Muted
         $status.Text = 'Idle - hotspot not running.'
         $status.ForeColor = $BodyText
@@ -2582,6 +2938,7 @@ $ctxClients = New-Object System.Windows.Forms.ContextMenuStrip
 if ($VRhsDarkMenu) { $ctxClients.Renderer = [VRhsDarkRenderer]::new() }
 $ctxPin = $ctxClients.Items.Add('Pin static IP for this device')
 $ctxWatch = $ctxClients.Items.Add('Watch latency (ping this device)')
+$ctxTest = $ctxClients.Items.Add('Test connection (ping + web ports)')
 [void]$ctxClients.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 $ctxCopy = $ctxClients.Items.Add('Copy MAC address')
 foreach ($it in $ctxClients.Items) { $it.ForeColor = $BodyText }
@@ -2600,6 +2957,7 @@ $ctxClients.Add_Opening({
     $on = ($lvClients.SelectedItems.Count -gt 0)
     $ctxPin.Enabled = $on
     $ctxWatch.Enabled = $on
+    $ctxTest.Enabled = $on
     $ctxCopy.Enabled = $on
 })
 
@@ -2640,6 +2998,45 @@ $ctxWatch.Add_Click({
     if ($lvClients.SelectedItems.Count -eq 0) { return }
     $it = $lvClients.SelectedItems[0]
     Watch-ClientByTag ([string]$it.Tag)
+})
+
+# run a quick reachability check on one device: three pings plus TCP
+# probes of the common web / printer ports, everything into the log.
+# Separates "device is gone" from "ping works but the web page does
+# not load" (which points at NAT / MTU / device-side issues instead).
+$ctxTest.Add_Click({
+    if ($lvClients.SelectedItems.Count -eq 0) { return }
+    $it = $lvClients.SelectedItems[0]
+    $ip = $it.SubItems[1].Text
+    Log "Connection test for $($it.Text) ($ip):"
+    $replied = 0
+    for ($i = 1; $i -le 3; $i++) {
+        $p = $null
+        try {
+            $p = New-Object System.Net.NetworkInformation.Ping
+            $r = $p.Send($ip, 1000)
+            if ($r.Status.ToString() -eq 'Success') { $replied++; Log ('  ping {0}/3: {1} ms' -f $i, [int]$r.RoundtripTime) }
+            else { Log ('  ping {0}/3: {1}' -f $i, $r.Status) }
+        } catch { Log ('  ping {0}/3: error - {1}' -f $i, $_.Exception.Message) }
+        finally { if ($p) { try { $p.Dispose() } catch { } } }
+        [System.Windows.Forms.Application]::DoEvents()
+        Start-Sleep -Milliseconds 200
+    }
+    Log ('  pings answered: {0}/3' -f $replied)
+    foreach ($port in @(80, 443, 631, 9100)) {
+        $c = $null
+        $open = $false
+        try {
+            $c = New-Object System.Net.Sockets.TcpClient
+            $ar = $c.BeginConnect($ip, $port, $null, $null)
+            if ($ar.AsyncWaitHandle.WaitOne(1200) -and $c.Connected) { $open = $true }
+        } catch { $open = $false }
+        finally { if ($c) { try { $c.Close() } catch { } } }
+        if ($open) { Log "  TCP port $port : OPEN" }
+        else { Log "  TCP port $port : closed or no answer" }
+        [System.Windows.Forms.Application]::DoEvents()
+    }
+    Log '  (a web page needs port 80 or 443; many printers also use 9100 for raw printing)'
 })
 
 $ctxCopy.Add_Click({
@@ -2752,6 +3149,14 @@ $timer.Add_Tick({
     }
     if (-not $cbTrack.Enabled) { $cbTrack.Enabled = $true }
 
+    # self-healing budget recovers after five stable minutes, so one bad
+    # radio incident cannot permanently exhaust it
+    if ($script:RestartCount -gt 0 -and $script:LastRestartAt -and $script:Pub -and [string]$script:Pub.Status -eq 'Started' -and ((Get-Date) - $script:LastRestartAt).TotalMinutes -ge 5) {
+        $script:RestartCount = 0
+        $script:LastRestartAt = $null
+        Log 'Hotspot stable for 5 minutes - auto-restart budget restored.'
+    }
+
     # ---- tracker liveness: a dead runspace must not freeze silently ----
     if ($script:ScanHandle -and $script:ScanHandle.IsCompleted -and -not $script:ScanDeadLogged) {
         $script:ScanDeadLogged = $true
@@ -2772,26 +3177,83 @@ $timer.Add_Tick({
         $status.ForeColor = $Red
     }
 
-    # ---- publisher health ----
+    # ---- DNS relay liveness (Router mode) ----
+    # DnsMode 'direct' means the relay stepped aside ON PURPOSE at bind time
+    # (clients were handed 1.1.1.1 directly) - that is not a death to report
+    if ($script:Running -and $sync.RouterMode -and [string]$sync.DnsMode -eq 'relay' -and $script:DnsHandle -and $script:DnsHandle.IsCompleted -and -not $script:DnsDeadLogged) {
+        $script:DnsDeadLogged = $true
+        Log 'DNS relay stopped unexpectedly - new name lookups may fail.'
+        $status.Text = 'WARNING: DNS relay died - clients may lose name resolution.'
+        $status.ForeColor = $Red
+    }
+
+    # ---- publisher health (v2.6.0: self-healing) ----
     if ($script:Pub) {
         $st = [string]$script:Pub.Status
         if ($st -eq 'Aborted' -or $st -eq 'Stopped') {
             $script:Busy = $true
             try {
                 Log "Publisher state: $st - hotspot lost."
-                Stop-Hotspot
-                $script:Running = $false
-                Set-Pill 'LOST' $Red
-                $status.Text = 'Hotspot LOST - restart it.'
-                $status.ForeColor = $Red
-                Clear-Sparkline
-                Refresh-Uplinks
-                $btnStart.Enabled = $true
-                $btnStop.Enabled = $false
-                try { $notifyIcon.ShowBalloonTip(3000, 'Hotspot lost', 'The access point stopped - restart it from the app.', [System.Windows.Forms.ToolTipIcon]::Error) } catch { }
+                Set-Pill 'STARTING' $Amber
+                $saved = $script:LastStart
+                $recovered = $false
+                if ($saved -and $script:RestartCount -lt 3) {
+                    $script:RestartCount++
+                    $script:LastRestartAt = Get-Date
+                    Log "Auto-restarting the same hotspot (attempt $($script:RestartCount) of 3)..."
+                    Stop-Hotspot
+                    Invoke-UIPump 3000
+                    $ok2 = Start-Hotspot -ssid $saved.ssid -pass $saved.pass -uplinkName $saved.uplink -routerMode ([bool]$saved.router) -vrMode ([bool]$saved.vr)
+                    if ($ok2) {
+                        $script:Running = $true
+                        Set-Pill 'RUNNING' $Green
+                        $status.Text = "RUNNING (auto-recovered)  -  SSID '$($saved.ssid)'"
+                        $status.ForeColor = $BodyText
+                        $btnStart.Enabled = $false
+                        $btnStop.Enabled = $true
+                        Log 'Auto-restart: the access point is back up.'
+                        try { $notifyIcon.ShowBalloonTip(2500, 'Hotspot restarted', 'The access point recovered automatically.', [System.Windows.Forms.ToolTipIcon]::Info) } catch { }
+                        $recovered = $true
+                    }
+                    else { Log 'Auto-restart failed.' }
+                }
+                if (-not $recovered) {
+                    Stop-Hotspot
+                    $script:Running = $false
+                    $script:LastStart = $null
+                    Set-Pill 'LOST' $Red
+                    $status.Text = 'Hotspot LOST - restart it.'
+                    $status.ForeColor = $Red
+                    Clear-Sparkline
+                    Refresh-Uplinks
+                    $btnStart.Enabled = $true
+                    $btnStop.Enabled = $false
+                    try { $notifyIcon.ShowBalloonTip(3000, 'Hotspot lost', 'The access point stopped - restart it from the app.', [System.Windows.Forms.ToolTipIcon]::Error) } catch { }
+                }
             }
-            finally { $script:Busy = $false }
+            finally {
+                $script:Busy = $false
+                if ($script:ClosePending) { $form.Close() }
+            }
             return
+        }
+    }
+
+    # retire keep-alive handles for clients that have gone away (the whole
+    # table is released on stop; this trims mid-session disconnects)
+    if (@($sync.WfdDevices.Keys).Count -gt 0) {
+        foreach ($k in @($sync.WfdDevices.Keys)) {
+            $d = $sync.WfdDevices[$k]
+            $gone = $false
+            try { if ([string]$d.ConnectionStatus -eq 'Disconnected') { $gone = $true } } catch { $gone = $true }
+            if ($gone) {
+                try { $d.Dispose() } catch { }
+                $sync.WfdDevices.Remove($k) | Out-Null
+                $rn = [string]$sync.WfdNames[$k]
+                $sync.WfdNames.Remove($k) | Out-Null
+                if (-not $rn) { $rn = $k }
+                Log "keep-alive released: $rn"
+            }
         }
     }
 
@@ -2804,8 +3266,9 @@ $timer.Add_Tick({
     $on = @($cl | Where-Object { $_.status -eq 'connected' }).Count
     $vrOn = 'OFF'
     if ((Test-Path $VrFlagFile) -or (Test-Path $VrFlagAlt)) { $vrOn = 'ON' }
-    if (-not $script:ScanDeadLogged -and -not $script:DhcpDeadLogged) {
-        $status.Text = ("RUNNING  |  SSID {0}  |  {1} device(s), {2} responsive  |  VR mode {3}" -f $tSsid.Text, $cl.Count, $on, $vrOn)
+    if (-not $script:ScanDeadLogged -and -not $script:DhcpDeadLogged -and -not $script:DnsDeadLogged) {
+        $held = @($sync.WfdDevices.Keys).Count
+        $status.Text = ("RUNNING  |  SSID {0}  |  {1} device(s), {2} responsive  |  keep-alive {3}  |  VR mode {4}" -f $tSsid.Text, $cl.Count, $on, $held, $vrOn)
         $status.ForeColor = $BodyText
     }
 })
@@ -2836,6 +3299,10 @@ $form.Add_FormClosing({
     if ($script:Running) { Stop-Hotspot }
     Stop-ClientScan
     Stop-DhcpServer
+    Stop-DnsServer
+    Stop-WfdKeeper
+    $script:LastStart = $null
+    try { Set-KeepAwake $false } catch { }
     try { Disable-VRMode | Out-Null } catch { }
     $notifyIcon.Visible = $false
     try { $notifyIcon.Dispose() } catch { }
@@ -2875,9 +3342,17 @@ Refresh-ResvList
 if (Disable-VRMode) {
     Log 'Crash recovery: Wi-Fi scans had been left paused - resumed now.'
 }
-# same idea for the DHCP firewall rule: a crash would have left the
-# inbound UDP 67 allow-rule behind
-Disable-DhcpFirewallRule
+# same idea for the server firewall rules and the NAT instance: a crash
+# would have left them behind
+Disable-SrvFirewallRules
+if ($script:HasNetTcpIp) {
+    try {
+        if (Get-NetNat -Name VRHotspotNAT -ErrorAction SilentlyContinue) {
+            Remove-NetNat -Name VRHotspotNAT -Confirm:$false
+            Log 'Crash recovery: leftover NAT instance removed.'
+        }
+    } catch { }
+}
 
 Log "Welcome to VR Hotspot Studio v$AppVersion."
 Log 'This hotspot uses Wi-Fi Direct (wlansvc), not the broken'
@@ -2887,6 +3362,8 @@ Log 'Tip: double-click a connected device to pin a static IP for it.'
 Log 'Tip: pick which device the graph follows from the Track list.'
 Log 'Tip: red bars are missed pings; the lower graph strip is the total'
 Log '     throughput of the whole hotspot (all devices).'
+Log 'Tip: right-click a device and run "Test connection" to check ping and'
+Log '     web/printer ports when a page will not load.'
 if ($cfg -and $cfg.uplink -and $cbUp.Items.Contains($cfg.uplink)) { $cbUp.SelectedItem = $cfg.uplink }
 
 $form.Add_Shown({

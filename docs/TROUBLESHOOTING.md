@@ -36,6 +36,28 @@ with VR mode on, check the **latency graph**: red bars while the green line
 is otherwise flat = radio-level interference; red bars with spiky green =
 client-side Wi-Fi issues (distance, 2.4 GHz, power saving on the headset).
 
+### Devices get kicked off after ~2 minutes (and the password is asked again)
+That was a real bug through v2.5.0, fixed at the root in v2.6.0: a Wi-Fi
+Direct access point must hold a `WiFiDirectDevice` session for every
+connected client - if nobody accepts the connection, Windows silently
+drops the client about two minutes after it associates. Printers,
+headsets, phones - anything. Some clients then refuse to rejoin until
+the password is retyped (it had not changed), and the repeated drops
+also break anything that needs a steady TCP connection, which looks
+like "no internet" or "the printer's web page will not load".
+
+v2.6.0 runs a `WiFiDirectConnectionListener` and holds every client
+session for as long as the hotspot runs. The status line shows
+`keep-alive N` (how many sessions are held), and the log writes one
+`[wfd] client accepted and held open: <name>` line per client. If the
+log shows `[wfd] could not accept ...` instead, that exact line is the
+report to file.
+
+Division of labor: the keep-alive handles a single dropped client (it
+reconnects and is re-accepted on its own); the automatic restart
+("Auto-restarting the same hotspot" in the log) only triggers when the
+access point itself dies.
+
 ### Windows can't find new networks / the uplink won't reconnect while the hotspot runs
 That is VR mode working as designed: scans are paused for an unbroken
 connection. Stop the hotspot to resume scanning. If the app crashed while
@@ -76,6 +98,20 @@ a bug.
 - **Router mode:** check the log for "NAT created". If NAT creation failed,
   run `Get-NetNat` in an elevated PowerShell and remove stale entries:
   `Get-NetNat | Remove-NetNat -Confirm:$false`, then restart the hotspot.
+  v2.6.0 also lists other NAT instances at start (WSL / Docker / Hyper-V
+  create their own) - Windows supports exactly ONE NAT network, so a
+  competing instance typically means internet sharing will not work until
+  it is removed.
+- **DNS check:** since v2.6.0 the log shows `[dns] relaying DNS (...)`
+  lines while clients resolve names through the hotspot PC (the first
+  five queries individually, then roughly one line per twenty). Queries
+  flowing but pages not loading points at NAT; no `[dns]` lines across
+  many lookups while a client browses points at the client's own
+  configuration or a dead relay. Right-click the device and run
+  **Test connection** for a quick ping + web-port check. The relay
+  forwards UDP only - DNS answers too large for UDP (rare: DNSSEC, long
+  TXT records) fail; clients fall back to their own resolvers on
+  truncation.
 - **Router mode on Windows 11 24H2+ / newer Insider builds:** the WinNAT
   component (`New-NetNat`) has known regressions on those builds. If the
   log shows "NAT creation failed" even after removing stale entries,
@@ -84,6 +120,22 @@ a bug.
   app was built for).
 - If the PC itself lost internet while the hotspot runs, the uplink adapter
   dropped - reconnect it and stop/start the hotspot so ICS re-binds.
+
+### Ping works but the printer's web page will not load
+Separate the layers: right-click the device and run **Test connection**
+(v2.6.0). It does three pings and probes TCP ports 80 / 443 / 9100, all
+into the log.
+- Pings fail = association/radio problem (see the keep-alive section
+  above; on v2.5.0 and earlier the ~2-minute client drop was breaking
+  exactly these long-lived TCP sessions while short pings recovered).
+- Pings fine, port 80/443 open = the printer side: some printers only
+  serve their web UI to the subnet they were configured on, or to
+  specific clients.
+- Pings fine, ports closed = something between: try the same page from
+  another client on the hotspot, and check whether the printer is
+  dual-homed (also cable-connected to another router) - dual-homed
+  printers often answer ping from one interface and serve HTTP on the
+  other.
 
 ### Clients list is empty even though a device is connected
 The list refreshes once per second from ARP entries. Browse something on the
@@ -111,7 +163,11 @@ and reservations are remembered.
 ### Where are my settings stored?
 `hotspot-settings.json` and `reservations.csv` next to the .ps1. The Wi-Fi
 password is in that JSON in plain text - it's a hotspot password, treat it
-accordingly.
+accordingly. Note for updates: extracting a new release ZIP into a NEW
+folder starts from scratch - a NEW random password is generated and the
+reservations are gone. Extract over the old folder (or copy the two files)
+to keep SSID, password and reservations; that also explains "the password
+changed after an update" surprises.
 
 ## The Windows Mobile Hotspot (original feature)
 

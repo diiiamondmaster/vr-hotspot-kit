@@ -56,6 +56,21 @@ That is it. The app needs no installation, no .NET downloads, no dependencies
   flicker when a device associates, the list keeps updating while VR mode
   is on, and devices only disappear after a grace period - leased or
   reserved devices never silently vanish (they show **offline** instead)
+- **Clients stay connected** (v2.6.0): the app accepts and holds a Wi-Fi
+  Direct session for every client - without one, Windows drops each client
+  about two minutes after it connects (the "kicked off after a few
+  minutes" bug that also made devices ask for the password again). The
+  status line shows the held count as `keep-alive N`
+- **Self-healing hotspot** (v2.6.0): if the access point ever dies, the
+  app restarts the same hotspot automatically (3 attempts; the budget
+  restores after 5 stable minutes), and system sleep is prevented while
+  hosting - a sleeping PC looks exactly like a dead hotspot
+- **Built-in DNS relay** (Router mode, v2.6.0): clients use the hotspot
+  PC as their resolver; the relay forwards to public DNS from the host
+  side (works around uplinks that filter client DNS) and logs queries
+- **"Test connection" on any device** (right-click): 3 pings plus TCP
+  probes of ports 80 / 443 / 9100, all logged - tells ping-but-no-web-page
+  apart from a dead device
 - **VR mode** (on by default): pauses Windows' background Wi-Fi scans while
   the hotspot runs - that scanning is what causes the every-few-minutes
   dropout that breaks rhythm games like Beat Saber. Scans resume
@@ -161,6 +176,9 @@ most common items:
 
 - **"Publisher ABORTED"** - another hotspot app still holds the radio.
   Fully exit MyPublicWiFi / turn the Windows toggle off, try again.
+- **Devices were kicked off after ~2 minutes / password asked again** -
+  a real bug through v2.5.0, fixed in v2.6.0 (Wi-Fi Direct drops
+  clients nobody holds a session for); details in the doc below.
 - **Clients connect, no internet** - wrong uplink selected, or the
   SharedAccess service stopped; details in the doc.
 - **The app will not start / PowerShell asks to "supply values"** -
@@ -176,6 +194,29 @@ most common items:
 
 ## Version history
 
+- **v2.6.0** - the "kicked off after a few minutes" fix, at the root. A
+  Wi-Fi Direct access point must hold a `WiFiDirectDevice` session for
+  every connected client; if nobody accepts the connection, Windows
+  silently drops the client roughly two minutes after it associates -
+  which is exactly what happened to printers and headsets (some clients
+  then refused to rejoin until the password was retyped, and repeated
+  drops looked like "no internet"). The app now runs a
+  `WiFiDirectConnectionListener`, accepts every client and holds its
+  session for as long as the hotspot runs; the count is visible in the
+  status line and one `[wfd]` log line is written per client. Also:
+  self-healing (the publisher is auto-restarted up to 3 times with the
+  budget restoring after 5 stable minutes), system sleep is prevented
+  while hosting, physical-adapter power saving is now disabled before
+  the AP starts with a real adapter reset so it actually applies (the
+  uplink may blip for a few seconds at start while the radio resets),
+  Router
+  mode gained a DNS relay (clients resolve through the hotspot PC;
+  falls back to direct resolvers), NAT startup lists competing NAT
+  instances (WSL / Docker / Hyper-V occupy the single NAT slot Windows
+  provides), latency pings carry an explicit timeout (fewer false red
+  dropout bars), and right-clicking a device offers **Test connection**
+  (3 pings + TCP probes of ports 80/443/9100, logged) for printers
+  whose web page will not load although ping works.
 - **v2.5.0** - the real startup fix (found via the v2.4.0 crash log).
   v2.3.0's DPI rework had added a layout helper named `SC()`; in
   PowerShell **aliases outrank functions**, and `sc` is the built-in
