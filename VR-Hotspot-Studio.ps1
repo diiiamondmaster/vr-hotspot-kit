@@ -1,6 +1,6 @@
 <#
 =====================================================================
- VR-Hotspot-Studio.ps1  v2.7.0
+ VR-Hotspot-Studio.ps1  v2.8.0
  A standalone Wi-Fi hotspot app that does NOT depend on the Windows
  Mobile Hotspot (icssvc/tethering) stack at all.
 
@@ -23,6 +23,27 @@
      subnet is YOUR choice now: any private /24 (10.x, 172.16-31.x,
      192.168.x) via the "Hotspot IP" box; a start-time check refuses
      subnets that collide with the uplink.
+
+v2.8.0:
+   - v2.7.0 still let clients drop. Its C# bridge only QUEUED each
+     connection request - the GUI accepted it up to a second later -
+     and it disposed the WiFiDirectConnectionRequest before the
+     accept ran. The official Microsoft Wi-Fi Direct sample accepts
+     inside the event handler itself and keeps the request object
+     alive until WiFiDirectDevice.FromIdAsync completes; deviating
+     from that can leave the association unaccepted, and Windows
+     drops such clients roughly two minutes later. The whole
+     keep-alive now lives in compiled C# and mirrors the sample:
+     the listener, the event handler, the immediate FromIdAsync
+     accept with one retry, the held-session table and a
+     ConnectionStatusChanged watch. PowerShell only reads log lines
+     and the session count - there is nothing left for PowerShell
+     5.1 to get wrong between the client knocking and being held.
+   - Every keep-alive step is logged now ([wfd] lines): request
+     seen, client accepted and held, session released, accept
+     failure or stall - plus a heartbeat every two minutes with the
+     number of held sessions. If a client is ever dropped again,
+     the log says exactly which stage failed instead of guessing.
 
 v2.7.0:
    - The v2.6.0 keep-alive could never arm. PowerShell 5.1's
@@ -175,7 +196,7 @@ v2.3.0:
 
 $ErrorActionPreference = 'Continue'
 $SelfTest   = ($env:VRHS_SELFTEST -eq '1')
-$AppVersion = '2.7.0'
+$AppVersion = '2.8.0'
 # v2.5.0 - alias guard (see the changelog at the top): `sc` is the
 # built-in alias of Set-Content and ALIASES OUTRANK FUNCTIONS in
 # command resolution, which is how the SC() helper got captured. The
@@ -220,8 +241,8 @@ $script:DhcpHandle  = $null
 $script:ResvCache   = $null      # reservations loaded from CSV
 $script:ScanRun     = $null      # runspace for the client tracker
 $script:ScanHandle  = $null
-$script:WfdListener = $null      # WiFiDirectConnectionListener (client keep-alive)
-$script:WfdArmed    = $false     # keep-alive event subscription active
+$script:WfdArmed    = $false     # keep-alive (C# WfdKeeper) armed
+$script:WfdLastBeat = $null      # last [wfd] heartbeat log time
 $script:DnsRun      = $null      # runspace for the DNS relay (router mode)
 $script:DnsHandle   = $null
 $script:LastStart   = $null      # params of the last successful start (auto-restart)
@@ -237,8 +258,6 @@ $sync.Reservations  = @{}                                   # macKey (bare) -> r
 $sync.Stop          = $false
 $sync.StopDns       = $false     # DNS relay loop control
 $sync.DnsMode       = 'relay'    # 'relay' = hand out the hotspot PC as DNS
-$sync.WfdDevices    = [hashtable]::Synchronized(@{})   # held client sessions (keep-alive)
-$sync.WfdNames      = [hashtable]::Synchronized(@{})   # held client id -> display name (logging)
 # client tracker state (written by the scan runspace, read by the GUI)
 $sync.Clients       = @()                                    # immutable snapshot published each cycle
 $sync.PingHist      = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
@@ -1404,65 +1423,41 @@ function Disable-SrvFirewallRules {
 # behavior - widely reported, e.g. StackOverflow question 65009169 -
 # and exactly the "kicked off after a few minutes / password asked
 # again" report). A WiFiDirectConnectionListener receives one
-# ConnectionRequested event per client (legacy WPA2 stations included);
-# the handler accepts it with WiFiDirectDevice.FromIdAsync and PARKS
-# the device object in $sync.WfdDevices. The reference is what keeps
-# the link alive - it is released when the client goes (the GUI tick
-# disposes disconnected entries) or when the hotspot stops.
+# ConnectionRequested event per client (legacy WPA2 stations included).
 #
-# PowerShell 5.1's Register-ObjectEvent CANNOT subscribe to WinRT
-# events - and it fails with a NON-terminating error, so v2.6.0
-# wrongly logged "armed" while the console showed "Windows PowerShell
-# cannot subscribe to Windows RT events" and clients kept dropping.
-# v2.7.0 subscribes from a tiny C# bridge compiled at runtime
-# (Compile-WfdBridge below): the bridge queues each request and the
-# GUI tick drains the queue and accepts on the UI thread.
+# v2.6.0 tried Register-ObjectEvent, which PowerShell 5.1 refuses
+# outright for Windows RT events (and fails NON-terminatingly, so the
+# app logged "armed" while nothing listened). v2.7.0 moved the event into
+# compiled C# but still accepted from the GUI tick, seconds later,
+# after disposing the WiFiDirectConnectionRequest - a deviation from
+# the official Microsoft sample, which accepts inside the handler and
+# keeps the request alive until FromIdAsync completes. v2.8.0 keeps
+# the entire flow in C#, sample-faithful: the bridge below creates
+# the listener, calls FromIdAsync the moment a client knocks (one
+# retry), parks BOTH the request and the device in a static table,
+# and watches ConnectionStatusChanged to release sessions whose
+# client left. PowerShell only reads log strings and the count.
 # =====================================================================
 function Start-WfdKeeper {
     Stop-WfdKeeper
     if ($SelfTest) { return }
-    # cache the closed generic AsTask binder for IAsyncOperation<WiFiDirectDevice>
-    $global:VRhsWfdAsTask = $null
-    try {
-        $m = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
-            $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
-            $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
-        })
-        if (@($m).Count -gt 0) {
-            $global:VRhsWfdAsTask = $m[0].MakeGenericMethod([Windows.Devices.WiFiDirect.WiFiDirectDevice,Windows.Devices.WiFiDirect,ContentType=WindowsRuntime])
-        }
-    } catch { $global:VRhsWfdAsTask = $null }
-    if (-not $global:VRhsWfdAsTask) {
-        Log 'Client keep-alive could not be armed: the WinRT async binder is missing.'
-        Log '  devices may be dropped after ~2 minutes - report this line.'
-        return
-    }
-    $global:VRhsSync = $sync
-    try {
-        $script:WfdListener = New-Object Windows.Devices.WiFiDirect.WiFiDirectConnectionListener
-    } catch {
-        Log "Client keep-alive: listener could not be created: $($_.Exception.Message)"
-        $script:WfdListener = $null
-        return
-    }
-    # PowerShell 5.1's Register-ObjectEvent cannot subscribe to WinRT
-    # events - and the failure is NON-terminating, so v2.6.0 logged
-    # "keep-alive armed" while the console showed "Windows PowerShell
-    # cannot subscribe to Windows RT events" and every client was still
-    # dropped after ~2 minutes. The event is subscribed from compiled
-    # C# instead: the bridge queues each request, the GUI tick accepts.
-    if (-not (Compile-WfdBridge)) {
-        $script:WfdListener = $null
-        return
-    }
-    try {
-        [VRhs.WfdBridge]::Arm($script:WfdListener)
-    }
+    if (-not (Compile-WfdKeeper)) { return }
+    $ok = $false
+    try { $ok = [VRhs.WfdKeeper]::Arm() }
     catch {
         Log "Client keep-alive could not be armed: $($_.Exception.Message)"
         Log '  devices may be dropped after ~2 minutes - report this line.'
-        try { [VRhs.WfdBridge]::Disarm() } catch { }
-        $script:WfdListener = $null
+        return
+    }
+    if (-not $ok) {
+        # Arm() puts its reason on the event queue - surface it now
+        for ($i = 0; $i -lt 10; $i++) {
+            $ev = $null
+            try { $ev = [VRhs.WfdKeeper]::TakeEvent() } catch { $ev = $null }
+            if (-not $ev) { break }
+            Log "[wfd] $ev"
+        }
+        Log 'Client keep-alive could not arm its listener - report the line above.'
         return
     }
     $script:WfdArmed = $true
@@ -1471,65 +1466,97 @@ function Start-WfdKeeper {
 }
 
 function Stop-WfdKeeper {
-    # disarm the C# bridge: event off, queue emptied. 'VRhs.WfdBridge'
-    # may not exist (compile failed or never armed) - the -as test never
-    # throws. Disarming also stops the tick drain from parking a dead
-    # session after the listener is gone.
-    $bridgeT = 'VRhs.WfdBridge' -as [type]
-    if ($bridgeT) { try { [VRhs.WfdBridge]::Disarm() } catch { Log "keep-alive disarm failed: $($_.Exception.Message)" } }
-    $global:VRhsWfdAsTask = $null
-    foreach ($k in @($sync.WfdDevices.Keys)) {
-        try { $sync.WfdDevices[$k].Dispose() } catch { }
-    }
-    $sync.WfdDevices.Clear()
-    $sync.WfdNames.Clear()
-    $script:WfdListener = $null
+    # disarm the C# keeper: listener event off, every held session
+    # disposed, queue emptied. 'VRhs.WfdKeeper' may not exist (compile
+    # failed or never armed) - the -as test never throws.
+    $keeperT = 'VRhs.WfdKeeper' -as [type]
+    if ($keeperT) { try { [VRhs.WfdKeeper]::Disarm() } catch { Log "keep-alive disarm failed: $($_.Exception.Message)" } }
     $script:WfdArmed = $false
+    $script:WfdLastBeat = $null
 }
 
 # =====================================================================
-# Compile-WfdBridge - compiles (once per process) the C# shim that
-# subscribes the WinRT ConnectionRequested event. PowerShell 5.1
-# cannot do this natively: Register-ObjectEvent rejects Windows RT
-# events outright. The C# handler runs on a WinRT threadpool thread
-# and only enqueues into a ConcurrentQueue - no PowerShell runs on
-# that thread; the GUI tick drains the queue via [VRhs.WfdBridge]::Take()
-# and calls Accept-WfdClient on the UI thread.
+# Compile-WfdKeeper - compiles (once per process) the C# keeper that
+# owns the whole client keep-alive. PowerShell 5.1 cannot subscribe
+# WinRT events (Register-ObjectEvent rejects them), so the listener,
+# the ConnectionRequested handler, the WiFiDirectDevice.FromIdAsync
+# accept and the held-session table all live in this compiled class;
+# PowerShell only receives short log strings (TakeEvent) and reads
+# the count (HeldCount). The accept flow mirrors the official
+# Microsoft Wi-Fi Direct sample: it starts in the event handler and
+# the request object stays alive until the accept has finished.
 # =====================================================================
-function Compile-WfdBridge {
-    $have = 'VRhs.WfdBridge' -as [type]
+function Compile-WfdKeeper {
+    $have = 'VRhs.WfdKeeper' -as [type]
     if ($have) { return $true }
 
     # C# 5 (the Add-Type compiler of PowerShell 5.1); ASCII only
     $wfdCs = @'
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Threading.Tasks;
 using Windows.Devices.Enumeration;
 using Windows.Devices.WiFiDirect;
 
 namespace VRhs
 {
-    // Bridge between the WinRT ConnectionRequested event and PowerShell
-    // 5.1: Register-ObjectEvent cannot subscribe to Windows RT events,
-    // so this class subscribes in C# and queues the requests; the GUI
-    // tick accepts them (WiFiDirectDevice.FromIdAsync) on the UI thread.
-    public static class WfdBridge
+    // Owns the client keep-alive end to end, exactly like the official
+    // Microsoft Wi-Fi Direct sample: the listener, the
+    // ConnectionRequested handler, the FromIdAsync accept (with one
+    // retry) and the table of held sessions all live in compiled code,
+    // because PowerShell 5.1 cannot subscribe to Windows RT events at
+    // all. PowerShell only reads log strings (TakeEvent) and the
+    // session count (HeldCount); every device object stays in here.
+    public static class WfdKeeper
     {
-        private static readonly ConcurrentQueue<string> _pending =
+        private class Held
+        {
+            public WiFiDirectDevice Device;
+            public WiFiDirectConnectionRequest Request;
+            public string Name;
+        }
+
+        private static readonly ConcurrentQueue<string> _events =
             new ConcurrentQueue<string>();
+        private static readonly ConcurrentDictionary<string, Held> _held =
+            new ConcurrentDictionary<string, Held>();
+        private static readonly object _gate = new object();
         private static WiFiDirectConnectionListener _listener;
 
-        public static void Arm(WiFiDirectConnectionListener listener)
+        public static bool Arm()
         {
-            // drop anything queued for a previous session: an event can
-            // land between Disarm's unsubscribe and its drain
-            string s;
-            while (_pending.TryDequeue(out s)) { }
-            _listener = listener;
-            listener.ConnectionRequested += OnRequested;
+            lock (_gate)
+            {
+                DrainEvents();
+                DetachListener();
+                try
+                {
+                    _listener = new WiFiDirectConnectionListener();
+                    _listener.ConnectionRequested += OnRequested;
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    _listener = null;
+                    _events.Enqueue("listener could not be created: " + ex.Message);
+                    return false;
+                }
+            }
         }
 
         public static void Disarm()
+        {
+            lock (_gate)
+            {
+                DetachListener();
+                List<string> ids = new List<string>(_held.Keys);
+                foreach (string id in ids) { Drop(id, "hotspot stopping"); }
+                DrainEvents();
+            }
+        }
+
+        private static void DetachListener()
         {
             if (_listener != null)
             {
@@ -1537,42 +1564,231 @@ namespace VRhs
                 catch { }
                 _listener = null;
             }
+        }
+
+        private static void DrainEvents()
+        {
             string s;
-            while (_pending.TryDequeue(out s)) { }
+            while (_events.TryDequeue(out s)) { }
         }
 
         private static void OnRequested(WiFiDirectConnectionListener sender,
                                         WiFiDirectConnectionRequestedEventArgs args)
         {
+            WiFiDirectConnectionRequest req = null;
             string id = "";
             string name = "";
             try
             {
-                WiFiDirectConnectionRequest req = args.GetConnectionRequest();
-                if (req != null)
+                req = args.GetConnectionRequest();
+                DeviceInformation di = req.DeviceInformation;
+                if (di != null)
                 {
-                    DeviceInformation di = req.DeviceInformation;
-                    if (di != null)
-                    {
-                        if (di.Id != null) { id = di.Id; }
-                        if (di.Name != null) { name = di.Name; }
-                    }
-                    try { req.Dispose(); } catch { }
+                    if (di.Id != null) { id = di.Id; }
+                    if (di.Name != null) { name = di.Name; }
                 }
             }
             catch (Exception ex)
             {
-                if (ex.Message != null) { name = "!read " + ex.Message; }
+                _events.Enqueue("connection request could not be read: " + ex.Message);
+                return;
             }
-            // tab-separated id + name; an empty id means the request
-            // could not be read (name carries the reason, if any)
-            _pending.Enqueue(id + "\t" + name);
+            if (id.Length == 0)
+            {
+                _events.Enqueue("connection request without an id: " + name);
+                if (req != null) { try { req.Dispose(); } catch { } }
+                return;
+            }
+            if (name.Length == 0) { name = "client"; }
+            _events.Enqueue("connection request from " + name);
+            StartAccept(id, name, req, 1);
         }
 
-        public static string Take()
+        private static void StartAccept(string id, string name,
+                                        WiFiDirectConnectionRequest req, int attempt)
+        {
+            Task<WiFiDirectDevice> t = null;
+            try
+            {
+                // the request object stays alive until the accept has
+                // finished - exactly what the official sample does
+                t = System.WindowsRuntimeSystemExtensions
+                    .AsTask<WiFiDirectDevice>(WiFiDirectDevice.FromIdAsync(id));
+            }
+            catch (Exception ex)
+            {
+                RetryOrGiveUp(id, name, req, attempt, "start: " + ex.Message);
+                return;
+            }
+            // a stalled accept must be visible in the log, not silent
+            Task.Delay(15000).ContinueWith(delegate
+            {
+                if (!t.IsCompleted)
+                {
+                    _events.Enqueue("accept still pending after 15 s: " + name);
+                }
+            });
+            t.ContinueWith(delegate(Task<WiFiDirectDevice> finish)
+            {
+                FinishAccept(id, name, req, attempt, finish);
+            }, TaskContinuationOptions.ExecuteSynchronously);
+        }
+
+        private static void RetryOrGiveUp(string id, string name,
+                                          WiFiDirectConnectionRequest req,
+                                          int attempt, string why)
+        {
+            if (attempt < 2)
+            {
+                _events.Enqueue("accept retry for " + name + " (" + why + ")");
+                Task.Delay(400).ContinueWith(delegate
+                {
+                    StartAccept(id, name, req, attempt + 1);
+                });
+            }
+            else
+            {
+                _events.Enqueue("accept FAILED for " + name + ": " + why);
+                if (req != null) { try { req.Dispose(); } catch { } }
+            }
+        }
+
+        private static void FinishAccept(string id, string name,
+                                         WiFiDirectConnectionRequest req,
+                                         int attempt, Task<WiFiDirectDevice> task)
+        {
+            try
+            {
+                if (task.IsFaulted || task.IsCanceled)
+                {
+                    string why = "canceled";
+                    if (task.Exception != null)
+                    {
+                        why = task.Exception.GetBaseException().Message;
+                    }
+                    RetryOrGiveUp(id, name, req, attempt, why);
+                    return;
+                }
+                WiFiDirectDevice dev = task.Result;
+                if (dev == null)
+                {
+                    RetryOrGiveUp(id, name, req, attempt,
+                                  "FromIdAsync returned nothing");
+                    return;
+                }
+                Held held = new Held();
+                held.Device = dev;
+                held.Request = req;
+                held.Name = name;
+                Held old;
+                if (_held.TryRemove(id, out old))
+                {
+                    DropHeld(old, "replaced by a newer session");
+                }
+                _held[id] = held;
+                try { dev.ConnectionStatusChanged += OnStatusChanged; }
+                catch { }
+                _events.Enqueue("client accepted and held open: " + name +
+                                " - sessions held: " + _held.Count);
+            }
+            catch (Exception ex)
+            {
+                _events.Enqueue("accept finishing error: " + ex.Message);
+                if (req != null) { try { req.Dispose(); } catch { } }
+            }
+        }
+
+        private static void OnStatusChanged(WiFiDirectDevice sender, object arg)
+        {
+            try
+            {
+                if (sender.ConnectionStatus !=
+                        WiFiDirectConnectionStatus.Disconnected)
+                {
+                    return;
+                }
+                List<string> ids = new List<string>(_held.Keys);
+                foreach (string id in ids)
+                {
+                    Held held;
+                    if (_held.TryGetValue(id, out held) &&
+                            object.ReferenceEquals(held.Device, sender))
+                    {
+                        Drop(id, "client left");
+                        return;
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private static void Drop(string id, string why)
+        {
+            Held held;
+            if (_held.TryRemove(id, out held)) { DropHeld(held, why); }
+        }
+
+        private static void DropHeld(Held held, string why)
+        {
+            try { held.Device.ConnectionStatusChanged -= OnStatusChanged; }
+            catch { }
+            try { held.Device.Dispose(); }
+            catch { }
+            // the request is released only now, after the session it
+            // belonged to is gone - never while a client is connected
+            try { if (held.Request != null) { held.Request.Dispose(); } }
+            catch { }
+            _events.Enqueue("keep-alive released: " + held.Name + " (" + why + ")");
+        }
+
+        // ---------- the small surface PowerShell is allowed to touch ----------
+
+        public static string TakeEvent()
         {
             string s;
-            return _pending.TryDequeue(out s) ? s : null;
+            return _events.TryDequeue(out s) ? s : null;
+        }
+
+        public static int HeldCount()
+        {
+            return _held.Count;
+        }
+
+        public static string HeldNames()
+        {
+            string all = "";
+            List<string> ids = new List<string>(_held.Keys);
+            foreach (string id in ids)
+            {
+                Held held;
+                if (_held.TryGetValue(id, out held))
+                {
+                    if (all.Length > 0) { all += ", "; }
+                    all += held.Name;
+                }
+            }
+            return all;
+        }
+
+        public static void Prune()
+        {
+            List<string> ids = new List<string>(_held.Keys);
+            foreach (string id in ids)
+            {
+                Held held;
+                if (!_held.TryGetValue(id, out held)) { continue; }
+                bool gone = false;
+                try
+                {
+                    if (held.Device.ConnectionStatus ==
+                            WiFiDirectConnectionStatus.Disconnected)
+                    {
+                        gone = true;
+                    }
+                }
+                catch { gone = true; }
+                if (gone) { Drop(id, "status: disconnected"); }
+            }
         }
     }
 }
@@ -1580,16 +1796,20 @@ namespace VRhs
 
     # reference paths, taken from the ALREADY-LOADED WinRT projections
     # (the app touched these types before arming), so the paths are the
-    # real on-disk DLLs and not a guess.
+    # real on-disk DLLs and not a guess. AsTask (the IAsyncOperation
+    # adapter the keeper needs) lives in System.Runtime.WindowsRuntime.
+    try { Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction Stop } catch { }
     $refs = @()
     try { $refs += [Windows.Devices.WiFiDirect.WiFiDirectConnectionListener,Windows.Devices.WiFiDirect,ContentType=WindowsRuntime].Assembly.Location } catch { }
     try { $refs += [Windows.Foundation.TypedEventHandler`2,Windows.Foundation,ContentType=WindowsRuntime].Assembly.Location } catch { }
     try { $refs += [Windows.Devices.Enumeration.DeviceInformation,Windows.Devices.Enumeration,ContentType=WindowsRuntime].Assembly.Location } catch { }
+    try { $refs += [System.WindowsRuntimeSystemExtensions].Assembly.Location } catch { }
     try { $refs += [object].Assembly.Location } catch { }
+    try { $refs += [System.Diagnostics.Debug].Assembly.Location } catch { }
     $refs = @($refs | Where-Object { $_ } | Select-Object -Unique)
 
     # GAC fallback for anything the type-literal load missed
-    foreach ($nm in @('Windows.Foundation', 'Windows.Devices.WiFiDirect', 'Windows.Devices.Enumeration')) {
+    foreach ($nm in @('Windows.Foundation', 'Windows.Devices.WiFiDirect', 'Windows.Devices.Enumeration', 'System.Runtime.WindowsRuntime')) {
         if (-not ($refs | Where-Object { $_ -like "*\$nm.dll" })) {
             try {
                 $g = Join-Path $env:windir "Microsoft.NET\assembly\GAC_MSIL\$nm"
@@ -1605,53 +1825,12 @@ namespace VRhs
     try {
         Add-Type -TypeDefinition $wfdCs -ReferencedAssemblies $refs -Language CSharp -ErrorAction Stop | Out-Null
     } catch {
-        Log 'Client keep-alive could not be compiled (the C# bridge).'
+        Log 'Client keep-alive could not be compiled (the C# keeper).'
         Log ("  compiler said: {0}" -f $_.Exception.Message)
         Log '  devices may be dropped after ~2 minutes - report these lines.'
         return $false
     }
     return $true
-}
-
-# =====================================================================
-# Accept-WfdClient - accepts ONE queued connection request handed over
-# by the C# bridge ("id<TAB>name"). Runs on the GUI tick, so the waits
-# stay capped: the happy path is milliseconds, the worst case ~5 s once
-# per flaky client.
-# =====================================================================
-function Accept-WfdClient([string]$item) {
-    $s  = $global:VRhsSync
-    $mi = $global:VRhsWfdAsTask
-    if (-not $s -or -not $mi) { return }
-    $id = ''; $nm = ''
-    $ti = $item.IndexOf("`t")
-    if ($ti -ge 0) {
-        $id = $item.Substring(0, $ti)
-        $nm = $item.Substring($ti + 1)
-    } else { $id = $item }
-    if (-not $id) {
-        Log "[wfd] connection request could not be read: $nm"
-        return
-    }
-    if ($s.WfdDevices.ContainsKey($id)) { return }
-    $dev = $null
-    $err = ''
-    for ($attempt = 1; $attempt -le 2 -and -not $dev; $attempt++) {
-        try {
-            $op = [Windows.Devices.WiFiDirect.WiFiDirectDevice,Windows.Devices.WiFiDirect,ContentType=WindowsRuntime]::FromIdAsync($id)
-            $tk = $mi.Invoke($null, @($op))
-            if (-not $tk.Wait(2500)) { throw 'accept timed out' }
-            $dev = $tk.Result
-        } catch { $err = $_.Exception.Message; if ($attempt -eq 1) { Start-Sleep -Milliseconds 300 } }
-    }
-    if ($dev) {
-        $s.WfdDevices[$id] = $dev
-        $s.WfdNames[$id] = $nm
-        Log "[wfd] client accepted and held open: $nm"
-    }
-    else {
-        Log "[wfd] could not accept $nm : $err"
-    }
 }
 
 # =====================================================================
@@ -3405,38 +3584,31 @@ $timer.Add_Tick({
         }
     }
 
-    # ---- client keep-alive: accept the connection requests the C#
-    # bridge queued (Register-ObjectEvent cannot subscribe to WinRT
-    # events on PowerShell 5.1 - the bridge is the only way in).
-    # Bounded per tick so the GUI thread never stalls on a storm.
+    # ---- client keep-alive: the C# keeper accepts clients the moment
+    # they knock (compiled code does it all - PowerShell 5.1 cannot
+    # subscribe to WinRT events); the GUI only drains its log lines
+    # and releases sessions whose client has gone.
     if ($script:WfdArmed) {
-        $drainStart = Get-Date
-        for ($qi = 0; $qi -lt 8; $qi++) {
-            $qitem = $null
-            try { $qitem = [VRhs.WfdBridge]::Take() } catch { $qitem = $null }
-            if (-not $qitem) { break }
-            Accept-WfdClient $qitem
-            # accept waits are capped per item, but a queue of dead ids
-            # must not stall the UI for all 8 - leave the rest for the
-            # next tick once the budget is spent
-            if (((Get-Date) - $drainStart).TotalSeconds -ge 10) { break }
-        }
-    }
-
-    # retire keep-alive handles for clients that have gone away (the whole
-    # table is released on stop; this trims mid-session disconnects)
-    if (@($sync.WfdDevices.Keys).Count -gt 0) {
-        foreach ($k in @($sync.WfdDevices.Keys)) {
-            $d = $sync.WfdDevices[$k]
-            $gone = $false
-            try { if ([string]$d.ConnectionStatus -eq 'Disconnected') { $gone = $true } } catch { $gone = $true }
-            if ($gone) {
-                try { $d.Dispose() } catch { }
-                $sync.WfdDevices.Remove($k) | Out-Null
-                $rn = [string]$sync.WfdNames[$k]
-                $sync.WfdNames.Remove($k) | Out-Null
-                if (-not $rn) { $rn = $k }
-                Log "keep-alive released: $rn"
+        $keeperT = 'VRhs.WfdKeeper' -as [type]
+        if ($keeperT) {
+            for ($qi = 0; $qi -lt 10; $qi++) {
+                $qev = $null
+                try { $qev = [VRhs.WfdKeeper]::TakeEvent() } catch { $qev = $null }
+                if (-not $qev) { break }
+                Log "[wfd] $qev"
+            }
+            try { [VRhs.WfdKeeper]::Prune() } catch { }
+            # heartbeat: the held-session count on its own line, so a
+            # dropped client always leaves a trail of what the keeper
+            # was holding when it happened
+            if (-not $script:WfdLastBeat) { $script:WfdLastBeat = Get-Date }
+            elseif (((Get-Date) - $script:WfdLastBeat).TotalSeconds -ge 120) {
+                $script:WfdLastBeat = Get-Date
+                $hn = ''
+                $hc = 0
+                try { $hn = [VRhs.WfdKeeper]::HeldNames(); $hc = [VRhs.WfdKeeper]::HeldCount() } catch { }
+                if ($hc -gt 0) { Log "[wfd] heartbeat: $hc session(s) held ($hn)" }
+                else { Log '[wfd] heartbeat: no sessions held' }
             }
         }
     }
@@ -3451,7 +3623,8 @@ $timer.Add_Tick({
     $vrOn = 'OFF'
     if ((Test-Path $VrFlagFile) -or (Test-Path $VrFlagAlt)) { $vrOn = 'ON' }
     if (-not $script:ScanDeadLogged -and -not $script:DhcpDeadLogged -and -not $script:DnsDeadLogged) {
-        $held = @($sync.WfdDevices.Keys).Count
+        $held = 0
+        try { $held = [VRhs.WfdKeeper]::HeldCount() } catch { }
         $status.Text = ("RUNNING  |  SSID {0}  |  {1} device(s), {2} responsive  |  keep-alive {3}  |  VR mode {4}" -f $tSsid.Text, $cl.Count, $on, $held, $vrOn)
         $status.ForeColor = $BodyText
     }

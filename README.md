@@ -56,14 +56,17 @@ That is it. The app needs no installation, no .NET downloads, no dependencies
   flicker when a device associates, the list keeps updating while VR mode
   is on, and devices only disappear after a grace period - leased or
   reserved devices never silently vanish (they show **offline** instead)
-- **Clients stay connected** (v2.6.0, actually working since v2.7.0):
+- **Clients stay connected** (v2.6.0; correct mechanism since v2.8.0):
   the app accepts and holds a Wi-Fi Direct session for every client -
   without one, Windows drops each client about two minutes after it
   connects (the "kicked off after a few minutes" bug that also made
-  devices ask for the password again). The subscription runs from a tiny
-  C# bridge compiled at runtime, because PowerShell 5.1's own event
-  engine cannot subscribe to WinRT events. The status line shows the
-  held count as `keep-alive N`
+  devices ask for the password again). The whole accept flow - event
+  subscription, the immediate `FromIdAsync` call, the held-session
+  table, the disconnect watch - runs inside a small C# keeper compiled
+  at runtime, because PowerShell 5.1's own event engine cannot
+  subscribe to WinRT events and its earlier hand-offs were too slow.
+  The status line shows the held count as `keep-alive N`, and a
+  `[wfd]` heartbeat logs the count every two minutes
 - **Self-healing hotspot** (v2.6.0): if the access point ever dies, the
   app restarts the same hotspot automatically (3 attempts; the budget
   restores after 5 stable minutes), and system sleep is prevented while
@@ -182,9 +185,11 @@ most common items:
 - **Devices were kicked off after ~2 minutes / password asked again** -
   a real bug through v2.5.0. v2.6.0 had the right fix but it could
   never arm on Windows PowerShell 5.1 (the console showed "Windows
-  PowerShell cannot subscribe to Windows RT events"); v2.7.0 subscribes
-  the event from a compiled C# bridge, so the held sessions actually
-  happen. Details in the doc below.
+  PowerShell cannot subscribe to Windows RT events"); v2.7.0 moved the
+  event subscription into compiled C# but still accepted each client
+  through a queue and disposed the connection request too early;
+  v2.8.0 runs the entire accept flow in C#, exactly like the official
+  Microsoft Wi-Fi Direct sample. Details in the doc below.
 - **Clients connect, no internet** - wrong uplink selected, or the
   SharedAccess service stopped; details in the doc.
 - **The app will not start / PowerShell asks to "supply values"** -
@@ -200,6 +205,24 @@ most common items:
 
 ## Version history
 
+- **v2.8.0** - the keep-alive done the way the official sample does it.
+  v2.7.0 moved the Wi-Fi Direct `ConnectionRequested` subscription into
+  compiled C# (PowerShell 5.1 cannot subscribe WinRT events), but it
+  still handed each request to the GUI timer and - the fatal flaw -
+  **disposed the `WiFiDirectConnectionRequest` before the accept ran**.
+  The official Microsoft sample accepts inside the event handler and
+  keeps the request object alive until `FromIdAsync` completes; a
+  request released early can leave the association unaccepted, and
+  Windows then drops that client about two minutes later, exactly the
+  symptom v2.7.0 still showed. v2.8.0 keeps the entire flow in C#:
+  the listener, the event handler, the immediate `FromIdAsync` accept
+  (with one retry), a held-session table strong enough that nothing in
+  PowerShell can release it by accident, and a
+  `ConnectionStatusChanged` watch that frees sessions when the client
+  actually leaves. Every step is logged (`[wfd]` lines: request seen,
+  accepted, released, failures, stalls) plus a two-minute heartbeat
+  with the held count - if a client is ever dropped again, the log
+  names the exact stage that failed.
 - **v2.7.0** - the v2.6.0 keep-alive, working for real this time.
   v2.6.0 subscribed the Wi-Fi Direct `ConnectionRequested` event with
   `Register-ObjectEvent` - but **Windows PowerShell 5.1 refuses to

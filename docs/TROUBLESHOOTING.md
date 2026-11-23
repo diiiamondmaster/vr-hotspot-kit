@@ -46,19 +46,27 @@ the password is retyped (it had not changed), and the repeated drops
 also break anything that needs a steady TCP connection, which looks
 like "no internet" or "the printer's web page will not load".
 
-v2.7.0 runs a `WiFiDirectConnectionListener` and holds every client
-session for as long as the hotspot runs. The subscription runs from a
-tiny C# bridge compiled at runtime - **Windows PowerShell 5.1's
-`Register-ObjectEvent` cannot subscribe to Windows RT events at all**,
-and it fails with a *non-terminating* error, so v2.6.0's version of
-this fix believed it was armed while nothing was listening (if the
-console showed "Windows PowerShell cannot subscribe to Windows RT
-events" on v2.6.0, that was exactly this). The status line shows
-`keep-alive N` (how many sessions are held), and the log writes one
-`[wfd] client accepted and held open: <name>` line per client. If the
-log shows `[wfd] could not accept ...` instead, or a "Client keep-alive
-could not be compiled" pair of lines, those exact lines are the report
-to file.
+v2.8.0 runs a `WiFiDirectConnectionListener` and holds every client
+session for as long as the hotspot runs - and the entire flow lives in
+compiled C#, mirroring the official Microsoft Wi-Fi Direct sample:
+the accept (`WiFiDirectDevice.FromIdAsync`) starts inside the event
+handler the instant a client knocks, the connection-request object
+stays alive until the accept finishes, and the held table is only
+touched from that compiled code. This matters because **Windows
+PowerShell 5.1's `Register-ObjectEvent` cannot subscribe to Windows
+RT events at all** (it fails *non-terminatingly*, so v2.6.0 believed
+it was armed while nothing listened - the "cannot subscribe to Windows
+RT events" console errors), and because v2.7.0's bridge still queued
+each request for the GUI timer and disposed the request object before
+the accept ran, which could leave associations unaccepted and clients
+dropped ~2 minutes later. The status line shows `keep-alive N` (how
+many sessions are held); the log writes `[wfd]` lines for every step -
+request seen, `client accepted and held open: <name>`, `keep-alive
+released: <name>`, accept failures and stalls - plus a heartbeat every
+two minutes with the held count. If a client is ever dropped again,
+copy the `[wfd]` lines around that moment (plus any "Client keep-alive
+could not be compiled" pair) into the bug report: they name the exact
+stage that failed.
 
 Division of labor: the keep-alive handles a single dropped client (it
 reconnects and is re-accepted on its own); the automatic restart
