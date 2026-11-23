@@ -1,6 +1,6 @@
 <#
 =====================================================================
- VR-Hotspot-Studio.ps1  v2.6.0
+ VR-Hotspot-Studio.ps1  v2.7.0
  A standalone Wi-Fi hotspot app that does NOT depend on the Windows
  Mobile Hotspot (icssvc/tethering) stack at all.
 
@@ -23,6 +23,23 @@
      subnet is YOUR choice now: any private /24 (10.x, 172.16-31.x,
      192.168.x) via the "Hotspot IP" box; a start-time check refuses
      subnets that collide with the uplink.
+
+v2.7.0:
+   - The v2.6.0 keep-alive could never arm. PowerShell 5.1's
+     Register-ObjectEvent refuses Windows RT events outright - and it
+     fails with a NON-terminating error, so the app logged "keep-alive
+     armed" while nothing was actually listening (the "Windows
+     PowerShell cannot subscribe to Windows RT events" errors in the
+     console) and every client was still dropped after ~2 minutes.
+     The ConnectionRequested event is now subscribed from a small C#
+     bridge compiled at runtime: the bridge queues each connection
+     request and the GUI tick accepts it, so the held-session fix
+     actually engages - [wfd] log lines now really appear per client.
+   - Phantom devices with the all-zero MAC (00:00:00:00:00:00) no
+     longer appear in the device list. Those rows are ARP probes that
+     got no answer (common when a VPN / tunnel such as Tailscale scans
+     the subnet from the host side); they used to show up as a fake
+     device fighting over a real device's reserved IP address.
 
 v2.6.0:
    - The "kicked off after a few minutes" bug, fixed at the root. A
@@ -158,7 +175,7 @@ v2.3.0:
 
 $ErrorActionPreference = 'Continue'
 $SelfTest   = ($env:VRHS_SELFTEST -eq '1')
-$AppVersion = '2.6.0'
+$AppVersion = '2.7.0'
 # v2.5.0 - alias guard (see the changelog at the top): `sc` is the
 # built-in alias of Set-Content and ALIASES OUTRANK FUNCTIONS in
 # command resolution, which is how the SC() helper got captured. The
@@ -1053,7 +1070,9 @@ while (-not $sync.StopScan) {
     elseif ($hasNb -and $ifIndex -gt 0) {
         try {
             $rows = @(Get-NetNeighbor -InterfaceIndex $ifIndex -ErrorAction SilentlyContinue |
-                Where-Object { $_.IPAddress -like "$subnet.*" -and $_.LinkLayerAddress } |
+                Where-Object { $_.IPAddress -like "$subnet.*" -and $_.LinkLayerAddress -and
+                               $_.LinkLayerAddress -notmatch '^00-00-00-00-00-00$' -and
+                               ($_.State -ne 'Incomplete' -and $_.State -ne 'Unreachable') } |
                 ForEach-Object { @{ ip = [string]$_.IPAddress; mac = [string]$_.LinkLayerAddress; state = [string]$_.State } })
         } catch { $rows = @() }
     }
@@ -1084,6 +1103,7 @@ while (-not $sync.StopScan) {
         $k = MacKey ([string]$r.mac)
         if (-not $k -or $k -notmatch '^[0-9a-f]{12}$') { continue }
         if ($k -match '^(ff|01005e|3333)') { continue }        # multicast/broadcast MACs
+        if ($k -eq '000000000000') { continue }                # phantom: an ARP probe nobody answered (VPN/tunnel subnet scans)
         $ip = [string]$r.ip
         # our own address: the classic .1 OR the configured gateway
         if (-not $ip -or $ip -eq "$subnet.1" -or $ip -eq ([string]$sync.ServerIP)) { continue }
@@ -1377,18 +1397,26 @@ function Disable-SrvFirewallRules {
 }
 
 # =====================================================================
-# client keep-alive - THE v2.6.0 fix. A Wi-Fi Direct access point must
-# hold a WiFiDirectDevice session for every connected client; if nobody
-# accepts the connection, Windows drops the client about two minutes
-# after it associates (known Wi-Fi Direct behavior - widely reported,
-# e.g. StackOverflow question 65009169 - and exactly
-# the "kicked off after a few minutes / password asked again" report).
-# A WiFiDirectConnectionListener receives one ConnectionRequested event
-# per client (legacy WPA2 stations included); the handler accepts it
-# with WiFiDirectDevice.FromIdAsync and PARKS the device object in
-# $sync.WfdDevices. The reference is what keeps the link alive - it is
-# released when the client goes (the GUI tick disposes disconnected
-# entries) or when the hotspot stops.
+# client keep-alive - THE fix for the ~2-minute client drops. A Wi-Fi
+# Direct access point must hold a WiFiDirectDevice session for every
+# connected client; if nobody accepts the connection, Windows drops
+# the client about two minutes after it associates (known Wi-Fi Direct
+# behavior - widely reported, e.g. StackOverflow question 65009169 -
+# and exactly the "kicked off after a few minutes / password asked
+# again" report). A WiFiDirectConnectionListener receives one
+# ConnectionRequested event per client (legacy WPA2 stations included);
+# the handler accepts it with WiFiDirectDevice.FromIdAsync and PARKS
+# the device object in $sync.WfdDevices. The reference is what keeps
+# the link alive - it is released when the client goes (the GUI tick
+# disposes disconnected entries) or when the hotspot stops.
+#
+# PowerShell 5.1's Register-ObjectEvent CANNOT subscribe to WinRT
+# events - and it fails with a NON-terminating error, so v2.6.0
+# wrongly logged "armed" while the console showed "Windows PowerShell
+# cannot subscribe to Windows RT events" and clients kept dropping.
+# v2.7.0 subscribes from a tiny C# bridge compiled at runtime
+# (Compile-WfdBridge below): the bridge queues each request and the
+# GUI tick drains the queue and accepts on the UI thread.
 # =====================================================================
 function Start-WfdKeeper {
     Stop-WfdKeeper
@@ -1417,68 +1445,38 @@ function Start-WfdKeeper {
         $script:WfdListener = $null
         return
     }
+    # PowerShell 5.1's Register-ObjectEvent cannot subscribe to WinRT
+    # events - and the failure is NON-terminating, so v2.6.0 logged
+    # "keep-alive armed" while the console showed "Windows PowerShell
+    # cannot subscribe to Windows RT events" and every client was still
+    # dropped after ~2 minutes. The event is subscribed from compiled
+    # C# instead: the bridge queues each request, the GUI tick accepts.
+    if (-not (Compile-WfdBridge)) {
+        $script:WfdListener = $null
+        return
+    }
     try {
-        $null = Register-ObjectEvent -InputObject $script:WfdListener -EventName ConnectionRequested -SourceIdentifier VRhsWfdKeeper -Action {
-            $s  = $global:VRhsSync
-            $mi = $global:VRhsWfdAsTask
-            if (-not $s -or -not $mi) { return }
-            $ea = $null
-            try { $ea = $Event.SourceEventArgs } catch { }
-            if (-not $ea) { try { $ea = $args[1] } catch { } }
-            if (-not $ea) { return }
-            $id = ''; $nm = ''
-            try {
-                $req = $ea.GetConnectionRequest()
-                $id  = [string]$req.DeviceInformation.Id
-                $nm  = [string]$req.DeviceInformation.Name
-                try { $req.Dispose() } catch { }
-            } catch {
-                try { $s.Log.Add("$(Get-Date -Format 'HH:mm:ss')  [wfd] connection request could not be read: $($_.Exception.Message)") | Out-Null } catch { }
-                return
-            }
-            if (-not $id) { return }
-            if ($s.WfdDevices.ContainsKey($id)) { return }
-            # engine event actions are drained on the GUI thread, so the
-            # waits are capped tightly: the happy path is milliseconds,
-            # the worst case ~5 s once per flaky client
-            $dev = $null
-            $err = ''
-            for ($attempt = 1; $attempt -le 2 -and -not $dev; $attempt++) {
-                try {
-                    $op = [Windows.Devices.WiFiDirect.WiFiDirectDevice,Windows.Devices.WiFiDirect,ContentType=WindowsRuntime]::FromIdAsync($id)
-                    $tk = $mi.Invoke($null, @($op))
-                    if (-not $tk.Wait(2500)) { throw 'accept timed out' }
-                    $dev = $tk.Result
-                } catch { $err = $_.Exception.Message; if ($attempt -eq 1) { Start-Sleep -Milliseconds 300 } }
-            }
-            if ($dev) {
-                $s.WfdDevices[$id] = $dev
-                $s.WfdNames[$id] = $nm
-                try { $s.Log.Add("$(Get-Date -Format 'HH:mm:ss')  [wfd] client accepted and held open: $nm") | Out-Null } catch { }
-            }
-            else {
-                try { $s.Log.Add("$(Get-Date -Format 'HH:mm:ss')  [wfd] could not accept $nm : $err") | Out-Null } catch { }
-            }
-        }
-        $script:WfdArmed = $true
-        Log 'Client keep-alive armed: every client gets a held Wi-Fi Direct session'
-        Log '  (without it Windows drops Wi-Fi Direct clients after about two minutes)'
-    } catch {
+        [VRhs.WfdBridge]::Arm($script:WfdListener)
+    }
+    catch {
         Log "Client keep-alive could not be armed: $($_.Exception.Message)"
         Log '  devices may be dropped after ~2 minutes - report this line.'
-        try { Unregister-Event -SourceIdentifier VRhsWfdKeeper -ErrorAction SilentlyContinue } catch { }
+        try { [VRhs.WfdBridge]::Disarm() } catch { }
         $script:WfdListener = $null
-        $script:WfdArmed = $false
+        return
     }
+    $script:WfdArmed = $true
+    Log 'Client keep-alive armed: every client gets a held Wi-Fi Direct session'
+    Log '  (without it Windows drops Wi-Fi Direct clients after about two minutes)'
 }
 
 function Stop-WfdKeeper {
-    if ($script:WfdArmed) {
-        try { Unregister-Event -SourceIdentifier VRhsWfdKeeper -ErrorAction SilentlyContinue } catch { }
-        try { Get-Job -Name 'VRhsWfdKeeper*' -ErrorAction SilentlyContinue | Remove-Job -Force -ErrorAction SilentlyContinue } catch { }
-    }
-    # also disarms stragglers: an action queued before the unregister
-    # finds no binder and no-ops instead of parking a dead session
+    # disarm the C# bridge: event off, queue emptied. 'VRhs.WfdBridge'
+    # may not exist (compile failed or never armed) - the -as test never
+    # throws. Disarming also stops the tick drain from parking a dead
+    # session after the listener is gone.
+    $bridgeT = 'VRhs.WfdBridge' -as [type]
+    if ($bridgeT) { try { [VRhs.WfdBridge]::Disarm() } catch { Log "keep-alive disarm failed: $($_.Exception.Message)" } }
     $global:VRhsWfdAsTask = $null
     foreach ($k in @($sync.WfdDevices.Keys)) {
         try { $sync.WfdDevices[$k].Dispose() } catch { }
@@ -1487,6 +1485,173 @@ function Stop-WfdKeeper {
     $sync.WfdNames.Clear()
     $script:WfdListener = $null
     $script:WfdArmed = $false
+}
+
+# =====================================================================
+# Compile-WfdBridge - compiles (once per process) the C# shim that
+# subscribes the WinRT ConnectionRequested event. PowerShell 5.1
+# cannot do this natively: Register-ObjectEvent rejects Windows RT
+# events outright. The C# handler runs on a WinRT threadpool thread
+# and only enqueues into a ConcurrentQueue - no PowerShell runs on
+# that thread; the GUI tick drains the queue via [VRhs.WfdBridge]::Take()
+# and calls Accept-WfdClient on the UI thread.
+# =====================================================================
+function Compile-WfdBridge {
+    $have = 'VRhs.WfdBridge' -as [type]
+    if ($have) { return $true }
+
+    # C# 5 (the Add-Type compiler of PowerShell 5.1); ASCII only
+    $wfdCs = @'
+using System;
+using System.Collections.Concurrent;
+using Windows.Devices.Enumeration;
+using Windows.Devices.WiFiDirect;
+
+namespace VRhs
+{
+    // Bridge between the WinRT ConnectionRequested event and PowerShell
+    // 5.1: Register-ObjectEvent cannot subscribe to Windows RT events,
+    // so this class subscribes in C# and queues the requests; the GUI
+    // tick accepts them (WiFiDirectDevice.FromIdAsync) on the UI thread.
+    public static class WfdBridge
+    {
+        private static readonly ConcurrentQueue<string> _pending =
+            new ConcurrentQueue<string>();
+        private static WiFiDirectConnectionListener _listener;
+
+        public static void Arm(WiFiDirectConnectionListener listener)
+        {
+            // drop anything queued for a previous session: an event can
+            // land between Disarm's unsubscribe and its drain
+            string s;
+            while (_pending.TryDequeue(out s)) { }
+            _listener = listener;
+            listener.ConnectionRequested += OnRequested;
+        }
+
+        public static void Disarm()
+        {
+            if (_listener != null)
+            {
+                try { _listener.ConnectionRequested -= OnRequested; }
+                catch { }
+                _listener = null;
+            }
+            string s;
+            while (_pending.TryDequeue(out s)) { }
+        }
+
+        private static void OnRequested(WiFiDirectConnectionListener sender,
+                                        WiFiDirectConnectionRequestedEventArgs args)
+        {
+            string id = "";
+            string name = "";
+            try
+            {
+                WiFiDirectConnectionRequest req = args.GetConnectionRequest();
+                if (req != null)
+                {
+                    DeviceInformation di = req.DeviceInformation;
+                    if (di != null)
+                    {
+                        if (di.Id != null) { id = di.Id; }
+                        if (di.Name != null) { name = di.Name; }
+                    }
+                    try { req.Dispose(); } catch { }
+                }
+            }
+            catch (Exception ex)
+            {
+                if (ex.Message != null) { name = "!read " + ex.Message; }
+            }
+            // tab-separated id + name; an empty id means the request
+            // could not be read (name carries the reason, if any)
+            _pending.Enqueue(id + "\t" + name);
+        }
+
+        public static string Take()
+        {
+            string s;
+            return _pending.TryDequeue(out s) ? s : null;
+        }
+    }
+}
+'@
+
+    # reference paths, taken from the ALREADY-LOADED WinRT projections
+    # (the app touched these types before arming), so the paths are the
+    # real on-disk DLLs and not a guess.
+    $refs = @()
+    try { $refs += [Windows.Devices.WiFiDirect.WiFiDirectConnectionListener,Windows.Devices.WiFiDirect,ContentType=WindowsRuntime].Assembly.Location } catch { }
+    try { $refs += [Windows.Foundation.TypedEventHandler`2,Windows.Foundation,ContentType=WindowsRuntime].Assembly.Location } catch { }
+    try { $refs += [Windows.Devices.Enumeration.DeviceInformation,Windows.Devices.Enumeration,ContentType=WindowsRuntime].Assembly.Location } catch { }
+    try { $refs += [object].Assembly.Location } catch { }
+    $refs = @($refs | Where-Object { $_ } | Select-Object -Unique)
+
+    # GAC fallback for anything the type-literal load missed
+    foreach ($nm in @('Windows.Foundation', 'Windows.Devices.WiFiDirect', 'Windows.Devices.Enumeration')) {
+        if (-not ($refs | Where-Object { $_ -like "*\$nm.dll" })) {
+            try {
+                $g = Join-Path $env:windir "Microsoft.NET\assembly\GAC_MSIL\$nm"
+                if (Test-Path $g) {
+                    $fd = Get-ChildItem -Path $g -Filter "$nm.dll" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+                    if ($fd) { $refs += $fd.FullName }
+                }
+            } catch { }
+        }
+    }
+    $refs = @($refs | Where-Object { $_ } | Select-Object -Unique)
+
+    try {
+        Add-Type -TypeDefinition $wfdCs -ReferencedAssemblies $refs -Language CSharp -ErrorAction Stop | Out-Null
+    } catch {
+        Log 'Client keep-alive could not be compiled (the C# bridge).'
+        Log ("  compiler said: {0}" -f $_.Exception.Message)
+        Log '  devices may be dropped after ~2 minutes - report these lines.'
+        return $false
+    }
+    return $true
+}
+
+# =====================================================================
+# Accept-WfdClient - accepts ONE queued connection request handed over
+# by the C# bridge ("id<TAB>name"). Runs on the GUI tick, so the waits
+# stay capped: the happy path is milliseconds, the worst case ~5 s once
+# per flaky client.
+# =====================================================================
+function Accept-WfdClient([string]$item) {
+    $s  = $global:VRhsSync
+    $mi = $global:VRhsWfdAsTask
+    if (-not $s -or -not $mi) { return }
+    $id = ''; $nm = ''
+    $ti = $item.IndexOf("`t")
+    if ($ti -ge 0) {
+        $id = $item.Substring(0, $ti)
+        $nm = $item.Substring($ti + 1)
+    } else { $id = $item }
+    if (-not $id) {
+        Log "[wfd] connection request could not be read: $nm"
+        return
+    }
+    if ($s.WfdDevices.ContainsKey($id)) { return }
+    $dev = $null
+    $err = ''
+    for ($attempt = 1; $attempt -le 2 -and -not $dev; $attempt++) {
+        try {
+            $op = [Windows.Devices.WiFiDirect.WiFiDirectDevice,Windows.Devices.WiFiDirect,ContentType=WindowsRuntime]::FromIdAsync($id)
+            $tk = $mi.Invoke($null, @($op))
+            if (-not $tk.Wait(2500)) { throw 'accept timed out' }
+            $dev = $tk.Result
+        } catch { $err = $_.Exception.Message; if ($attempt -eq 1) { Start-Sleep -Milliseconds 300 } }
+    }
+    if ($dev) {
+        $s.WfdDevices[$id] = $dev
+        $s.WfdNames[$id] = $nm
+        Log "[wfd] client accepted and held open: $nm"
+    }
+    else {
+        Log "[wfd] could not accept $nm : $err"
+    }
 }
 
 # =====================================================================
@@ -1622,6 +1787,7 @@ function Start-Hotspot {
         if ([string]$script:Pub.Status -eq 'Aborted') {
             Log "Publisher ABORTED (driver refused the AP)."
             $script:Pub = $null
+            Stop-WfdKeeper
             return $false
         }
         $script:VAdapter = Get-WfdAdapter
@@ -3236,6 +3402,24 @@ $timer.Add_Tick({
                 if ($script:ClosePending) { $form.Close() }
             }
             return
+        }
+    }
+
+    # ---- client keep-alive: accept the connection requests the C#
+    # bridge queued (Register-ObjectEvent cannot subscribe to WinRT
+    # events on PowerShell 5.1 - the bridge is the only way in).
+    # Bounded per tick so the GUI thread never stalls on a storm.
+    if ($script:WfdArmed) {
+        $drainStart = Get-Date
+        for ($qi = 0; $qi -lt 8; $qi++) {
+            $qitem = $null
+            try { $qitem = [VRhs.WfdBridge]::Take() } catch { $qitem = $null }
+            if (-not $qitem) { break }
+            Accept-WfdClient $qitem
+            # accept waits are capped per item, but a queue of dead ids
+            # must not stall the UI for all 8 - leave the rest for the
+            # next tick once the budget is spent
+            if (((Get-Date) - $drainStart).TotalSeconds -ge 10) { break }
         }
     }
 

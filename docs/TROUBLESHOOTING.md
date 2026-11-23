@@ -46,12 +46,19 @@ the password is retyped (it had not changed), and the repeated drops
 also break anything that needs a steady TCP connection, which looks
 like "no internet" or "the printer's web page will not load".
 
-v2.6.0 runs a `WiFiDirectConnectionListener` and holds every client
-session for as long as the hotspot runs. The status line shows
+v2.7.0 runs a `WiFiDirectConnectionListener` and holds every client
+session for as long as the hotspot runs. The subscription runs from a
+tiny C# bridge compiled at runtime - **Windows PowerShell 5.1's
+`Register-ObjectEvent` cannot subscribe to Windows RT events at all**,
+and it fails with a *non-terminating* error, so v2.6.0's version of
+this fix believed it was armed while nothing was listening (if the
+console showed "Windows PowerShell cannot subscribe to Windows RT
+events" on v2.6.0, that was exactly this). The status line shows
 `keep-alive N` (how many sessions are held), and the log writes one
 `[wfd] client accepted and held open: <name>` line per client. If the
-log shows `[wfd] could not accept ...` instead, that exact line is the
-report to file.
+log shows `[wfd] could not accept ...` instead, or a "Client keep-alive
+could not be compiled" pair of lines, those exact lines are the report
+to file.
 
 Division of labor: the keep-alive handles a single dropped client (it
 reconnects and is re-accepted on its own); the automatic restart
@@ -71,6 +78,18 @@ the device list as long as they stay associated, and the graph goes amber.
 That is honest data, not an error: start streaming and the green line comes
 back. To track a different device, right-click it in Connected devices and
 pick **Watch latency**. Red bars on a green line = real dropouts.
+
+### A phantom device with MAC 00:00:00:00:00:00 (or one that "steals" a reserved IP)
+Those rows are ARP probes that got no answer. When a VPN or tunnel is
+running on the host (Tailscale is the common one - it scans the subnet
+it routes), Windows records the probed addresses on every interface,
+including the hotspot's, as neighbor entries with an all-zero MAC while
+nothing answers. Through v2.6.0 the tracker happily turned those rows
+into fake devices, which then appeared to fight over a real device's
+reserved IP (typically the printer's, because that is the address being
+probed). v2.7.0 filters all-zero MACs and unresolvable neighbor states
+(`Incomplete` / `Unreachable`) at both the query and the merge step, so
+phantom devices no longer appear. The probe traffic itself is harmless.
 
 ### The device list shows a device as "reconnect" or "offline"
 "reconnect" (amber) = the device stopped responding but is still within
