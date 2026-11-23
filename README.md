@@ -44,7 +44,12 @@ That is it. The app needs no installation, no .NET downloads, no dependencies
   **per-MAC static IP reservations** - built for 3D printers and other
   devices that need a fixed address (see
   [docs/PRINTER-STATIC-IP.md](docs/PRINTER-STATIC-IP.md))
-- **Connected-clients list** (name / IP / MAC, names from your reservations)
+- **Connected-clients list** that actually stays live: a background
+  tracker merges the ARP table, DHCP leases and a 1-per-second keepalive
+  ping into one stable list (name / IP / MAC / status), so entries do not
+  flicker when a device associates, the list keeps updating while VR mode
+  is on, and devices only disappear after a grace period - leased or
+  reserved devices never silently vanish (they show **offline** instead)
 - **VR mode** (on by default): pauses Windows' background Wi-Fi scans while
   the hotspot runs - that scanning is what causes the every-few-minutes
   dropout that breaks rhythm games like Beat Saber. Scans resume
@@ -53,16 +58,21 @@ That is it. The app needs no installation, no .NET downloads, no dependencies
 - **Adapter power saving is always disabled** while the hotspot runs - no
   toggle, by design (Realtek power saving causes micro-stutters)
 - **Auto-start on launch** (optional checkbox)
-- **Live latency graph**: pings the first connected client twice a second;
-  green line = milliseconds, red bars = dropouts, so connection health is
-  visible at a glance
+- **Live latency graph** that works in both sharing modes and tracks any
+  device you choose: green filled line = milliseconds (with avg/max), red
+  bars = dropouts. Right-click a connected device and "Watch latency" to
+  aim the graph at it; by default it follows the first connected client
+- **Click a device to pin a static IP**: double-click a connected device
+  (or right-click it, or use the "Pin static IP" button) and the
+  reservation dialog comes up pre-filled with its name, MAC and a
+  suggested free IP - no MAC typing, ever
 - **System tray integration**: minimizes to the hidden-icons area with its
-  own green signal-wave icon; right-click menu (open / start / stop / exit)
+  own teal signal-wave icon; right-click menu (open / start / stop / exit)
   and balloon notifications on start/stop
 - **Copy SSID+pass button** for the clipboard
-- Static-IP reservations can be filled in by **picking a connected device
-  from a dropdown** - no typing MAC addresses
 - **Live log** with band/channel display
+- **Redesigned dark UI**: flat cards, teal accents, status pill, responsive
+  window (no freezing during start/stop, scrolls on small screens)
 - No telemetry, no background services, nothing installed - close the
   window and everything is gone (settings are kept in two small files next
   to the scripts)
@@ -140,6 +150,27 @@ most common items:
   SharedAccess service stopped; details in the doc.
 - **A 2.4 GHz-only device can't see the hotspot** - you're on a 5 GHz
   uplink; the band follows the uplink (see above).
+
+## Version history
+
+- **v2.2.0** - device tracker rework: no more blinking entries on connect,
+  the list keeps updating with VR mode on, latency graph works in Router
+  mode too and survives power-saving clients (1 s / 1 s timeout pings that
+  double as keepalives), click-to-pin static reservations, "Watch latency"
+  on any device, log no longer freezes after long sessions, start/stop no
+  longer freezes the window, redesigned dark UI. Hardened after a
+  three-agent code review: thread-safe snapshot reads everywhere,
+  RFC-correct DHCP lease option byte order, 12 h lease expiry, sanitized
+  client hostnames, firewall rule for the built-in DHCP server, ICS subnet
+  auto-adoption, single-instance guard, non-ASCII adapter names safe in
+  the VR-mode flag. Validated by a 108-assertion automated suite (parse,
+  units, real loopback DHCP incl. hostile-hostname handling, simulated
+  neighbor lifecycle, 10 s concurrency stress, real GDI+ drawing) plus
+  PSScriptAnalyzer PS 5.1 syntax checking (zero findings).
+- **v2.1.0** - fixed the v2.0.0 startup errors, static IP reservations
+  (broken since v1), DHCP correctness, hotspot restart race.
+- **v2.0.0** - VR mode, auto-start, tray icon, latency graph.
+- **v1.x** - the original Wi-Fi Direct hotspot app.
 
 ## Why the repo exists
 

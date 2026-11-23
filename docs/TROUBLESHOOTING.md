@@ -21,10 +21,19 @@ connection. Stop the hotspot to resume scanning. If the app crashed while
 VR mode was on, simply launch it again - it detects the leftover
 `vrmode.flag` and resumes scanning automatically.
 
-### Latency graph shows "NO REPLY" but the connection works
-The graph pings the FIRST client in the Connected devices list. If that
-device sleeps (printers do), pick a different situation or ignore it - the
-ping target follows the top of the list.
+### Latency graph shows "not answering pings" but the connection works
+Some devices stop answering ICMP pings while idle (headsets at the menu,
+phones with the screen off, printers that sleep) - the app keeps them in
+the device list as long as they stay associated, and the graph goes amber.
+That is honest data, not an error: start streaming and the green line comes
+back. To track a different device, right-click it in Connected devices and
+pick **Watch latency**. Red bars on a green line = real dropouts.
+
+### The device list shows a device as "reconnect" or "offline"
+"reconnect" (amber) = the device stopped responding but is still within
+the grace window - it usually comes back on its own. "offline" (gray) = a
+leased or reserved device that is currently gone; it keeps its row (and
+its reservation) and comes back when it reconnects.
 
 ### "Publisher ABORTED (driver refused the AP)" right after START
 Another program is already holding the Wi-Fi radio's AP role, or the Wi-Fi
@@ -95,28 +104,3 @@ industry-wide; Wi-Fi Direct replaced it. Nothing to fix.
 ### Bluetooth audio is broken too
 Separate tiny11 casualty: the `BthAvctpSvc` service is missing from the
 image. The Surgical Repair (DISM from ISO) can restore it as well.
-
-## VR Hotspot Studio
-
-### Startup printed "Join-Path ... Path is null" (v2.0.0 only)
-v2.0.0 built `vrmode.flag`'s path from the script-folder variable two
-lines before that variable existed. The app still ran, but the VR-mode
-crash-recovery flag never worked and the errors were noisy. Fixed in
-v2.1.0 - upgrade (Downloads below always point at the newest release).
-
-### Static IP reservations did not stick (v1.x / v2.0.0)
-The reservation list and the built-in DHCP server used two different
-MAC formats (with vs. without colons), so a reservation never matched
-the device asking for an address. Fixed in v2.1.0: MACs are normalized
-everywhere, and reservations can be added/removed while the hotspot
-runs - reconnect the device (Wi-Fi off/on) to pick up the new address.
-
-### The window does not fit my screen
-Since v2.1.0 the window scrolls instead of getting cut off on small
-displays.
-
-### "Another hotspot adapter is UP"
-Only one hotspot can hold the Wi-Fi radio. Stop MyPublicWiFi (or any
-other hotspot app) first. Since v2.1.0 restarting the hotspot right
-after stopping it also works - the app waits for the old virtual
-adapter to disappear.
