@@ -76,9 +76,10 @@ That is it. The app needs no installation, no .NET downloads, no dependencies
   (or right-click it, or use the "Pin static IP" button) and the
   reservation dialog comes up pre-filled with its name, MAC and a
   suggested free IP - no MAC typing, ever
-- **System tray integration**: minimizes to the hidden-icons area with its
-  own teal signal-wave icon; right-click menu (open / start / stop / exit)
-  and balloon notifications on start/stop
+- **System tray icon** (teal signal wave) with a right-click menu
+  (open / start / stop / exit) and balloon notifications on start/stop -
+  while the window itself minimizes normally to the taskbar (v2.4.0:
+  it no longer hides into the collapsed tray, which looked like a crash)
 - **Copy SSID+pass button** for the clipboard
 - **Live log** with band/channel display
 - **Redesigned dark UI**: flat cards, teal accents, status pill, responsive
@@ -127,6 +128,8 @@ flaky. The checkbox state is remembered between runs.
 
 - `hotspot-settings.json` - your settings
 - `reservations.csv` - static IP reservations
+- `studio-crash.log` - written only if the app ever fails to start; it
+  contains the exact error - keep it when reporting a problem (v2.4.0)
 - `vrmode.flag` - crash-safety marker while VR mode has Wi-Fi scans paused
   (deleted automatically when scans resume; if the app ever crashes while
   running, the next launch cleans it up)
@@ -160,11 +163,28 @@ most common items:
   Fully exit MyPublicWiFi / turn the Windows toggle off, try again.
 - **Clients connect, no internet** - wrong uplink selected, or the
   SharedAccess service stopped; details in the doc.
+- **The app will not start / PowerShell asks to "supply values"** - not
+  possible since v2.4.0: the launcher runs PowerShell with
+  `-NonInteractive`, and any startup crash lands in `studio-crash.log`
+  (a script that fails to even parse exits before a log can be written -
+  the console shows that error instead).
 - **A 2.4 GHz-only device can't see the hotspot** - you're on a 5 GHz
   uplink; the band follows the uplink (see above).
 
 ## Version history
 
+- **v2.4.0** - startup robustness and two bug fixes: the launcher now
+  runs PowerShell with `-NonInteractive` (no more freezing on a
+  "Supply values for the following parameters" prompt, whatever its
+  cause), checks admin rights with `fltmc` (no Server-service
+  dependency, no elevation loop on stripped Windows images), keeps the
+  console open after a failed launch, and writes any unhandled startup
+  error to `studio-crash.log` with a message box; minimizing the window
+  is a normal taskbar minimize now (it no longer hides into the tray
+  and looks like the program closed); and the bandwidth strip was fixed
+  - `Get-NetAdapterStatistics` has no `-InterfaceIndex` parameter, so
+  the v2.3.0 sampling silently never worked on real Windows (counters
+  are now matched by exact adapter name).
 - **v2.3.0** - your-subnet Router mode (any private /24, uplink-collision
   guard, stale-address cleanup, per-subnet reservation filtering), the
   latency card gained a visible **Track** dropdown and a live **bandwidth

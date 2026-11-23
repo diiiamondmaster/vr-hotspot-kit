@@ -4,6 +4,9 @@ HotspotBootFix.log
 *.reg
 hotspot-settings.json
 reservations.csv
+studio-crash.log
+vrmode.flag
+vrhs-vrmode.flag
 FallbackHotspot.txt
 Start-Hotspot-Fallback.bat
 

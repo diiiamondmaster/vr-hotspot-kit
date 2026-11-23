@@ -1,6 +1,6 @@
 <#
 =====================================================================
- VR-Hotspot-Studio.ps1  v2.3.0
+ VR-Hotspot-Studio.ps1  v2.4.0
  A standalone Wi-Fi hotspot app that does NOT depend on the Windows
  Mobile Hotspot (icssvc/tethering) stack at all.
 
@@ -23,6 +23,27 @@
      subnet is YOUR choice now: any private /24 (10.x, 172.16-31.x,
      192.168.x) via the "Hotspot IP" box; a start-time check refuses
      subnets that collide with the uplink.
+
+v2.4.0:
+   - Launcher hardening (fixes the "trouble starting" report):
+     PowerShell now runs with -NonInteractive, so no bug can ever leave
+     the app frozen on a "Supply values for the following parameters"
+     console prompt - a prompting command fails fast with a visible
+     error instead. The admin check uses fltmc instead of "net session"
+     (the latter depends on the Server service, which stripped Windows
+     images often lack, and can loop on the elevation prompt forever).
+     Any unhandled startup error is now written to studio-crash.log
+     next to the script and shown in a message box, and the console
+     stays open after a failed launch so nothing disappears silently.
+   - Minimizing the window no longer hides it into the system tray:
+     it is a plain taskbar minimize now. (The old hide-on-minimize
+     made the app look closed whenever Windows 11 collapsed the tray
+     icons; the taskbar button just vanished.) The tray icon stays
+     available for its right-click menu.
+   - Bandwidth graph actually works now: Get-NetAdapterStatistics has
+     NO -InterfaceIndex parameter, so the v2.3.0 sampling failed every
+     cycle on real Windows (the test rig only exercised the sim path).
+     Adapter counters are now matched by exact adapter name.
 
 v2.3.0:
    - Hotspot IP field: Router mode is no longer locked to
@@ -76,7 +97,7 @@ v2.3.0:
 
 $ErrorActionPreference = 'Continue'
 $SelfTest   = ($env:VRHS_SELFTEST -eq '1')
-$AppVersion = '2.3.0'
+$AppVersion = '2.4.0'
 
 # NetAdapter cmdlets are missing on some stripped images - detect once
 # so the app can degrade with a clear message instead of dying at load
@@ -140,8 +161,7 @@ $sync.BwFail        = $false     # true when adapter counters are unavailable
 $sync.BwTotalR      = [long]0    # session total bytes, hotspot RX (from devices)
 $sync.BwTotalT      = [long]0    # session total bytes, hotspot TX (to devices)
 $sync.BwIfName      = ''         # adapter the tracker samples counters on
-$sync.BwIfIndex     = 0          # its interface index (hidden adapters
-                                 # are only reliably addressable by index)
+                                 # (matched by exact name - see the tracker)
 $sync.SimBw         = [hashtable]::Synchronized(@{})   # test hook: r / t Mbps
 
 $script:Subnet   = '192.168.137'
@@ -154,6 +174,41 @@ function Log([string]$t) {
     $stamp = Get-Date -Format 'HH:mm:ss'
     $sync.Log.Add("$stamp  $t") | Out-Null
     if ($sync.Log.Count -gt 300) { $sync.Log.RemoveRange(0, 100) }
+}
+
+# Last-resort crash recorder (v2.4.0): an unhandled error in the GUI
+# startup path is appended to studio-crash.log next to the script
+# (%TEMP% fallback), so a failed launch leaves something diagnosable
+# instead of a console that flashes and vanishes. The log is trimmed
+# when it grows past ~32 KB so it cannot expand forever.
+function Write-CrashLog($err) {
+    try {
+        $lines = @('=' * 60)
+        $lines += "time:    $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+        $lines += "app:     VR-Hotspot-Studio v$AppVersion  (PowerShell $($PSVersionTable.PSVersion))"
+        if ($err) {
+            $lines += "error:   $($err.Exception.Message)"
+            $lines += "type:    $($err.Exception.GetType().FullName)"
+            if ($err.InvocationInfo -and $err.InvocationInfo.ScriptLineNumber) {
+                $lines += "at line: $($err.InvocationInfo.ScriptLineNumber): $($err.InvocationInfo.Line)"
+            }
+        }
+        else { $lines += 'error:   (no error details)' }
+        $file = Join-Path $ScriptDir 'studio-crash.log'
+        try { Add-Content -Path $file -Value $lines -Encoding UTF8 -ErrorAction Stop }
+        catch {
+            $file = Join-Path ([System.IO.Path]::GetTempPath()) 'vrhs-crash.log'
+            Add-Content -Path $file -Value $lines -Encoding UTF8 -ErrorAction SilentlyContinue
+            if (-not (Test-Path $file)) { return $null }
+        }
+        try {
+            if ((Test-Path $file) -and ((Get-Item $file).Length -gt 32768)) {
+                $keep = @(Get-Content $file | Select-Object -Last 240)
+                Set-Content -Path $file -Value $keep -Encoding UTF8
+            }
+        } catch { }
+        return $file
+    } catch { return $null }
 }
 
 function Load-Settings {
@@ -337,10 +392,10 @@ function Format-Bytes([double]$v) {
 }
 
 function Get-UplinkAdapters {
-    if (-not $script:HasNetAdapter) { return $null }
-    Get-NetAdapter -ErrorAction SilentlyContinue |
+    if (-not $script:HasNetAdapter) { return @() }
+    @(Get-NetAdapter -ErrorAction SilentlyContinue |
         Where-Object { $_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch 'Wi-Fi Direct|Hosted|Tailscale|Loopback' } |
-        Sort-Object -Property @{Expression = { if ($_.InterfaceDescription -like '*802.11*') { 0 } else { 1 } }}
+        Sort-Object -Property @{Expression = { if ($_.InterfaceDescription -like '*802.11*') { 0 } else { 1 } }})
 }
 
 function Get-WfdAdapter {
@@ -433,13 +488,20 @@ function Disable-AllIcs {
 }
 
 function Enable-IcsOnNames([string]$uplinkName, [string]$privateName) {
-    $shr = New-Object -ComObject HNetCfg.HNetShare
+    # the HNetCfg COM class can be missing or half-broken on stripped
+    # images (exactly the machines this app targets) - a failure here
+    # must degrade to the caller's "ICS could not be enabled - try
+    # Router mode" path, not unwind the whole start flow
+    try { $shr = New-Object -ComObject HNetCfg.HNetShare }
+    catch { Log "ICS COM not available: $($_.Exception.Message)"; return $false }
     $okPub = $false; $okPriv = $false
     foreach ($c in $shr.EnumEveryConnection) {
-        $props = $shr.NetConnectionProps($c)
-        $cfg = $shr.INetSharingConfigurationForINetConnection($c)
-        if ($props.Name -eq $uplinkName)  { try { $cfg.EnableSharing(0); $okPub = $true } catch { } }
-        if ($props.Name -eq $privateName) { try { $cfg.EnableSharing(1); $okPriv = $true } catch { } }
+        try {
+            $props = $shr.NetConnectionProps($c)
+            $cfg = $shr.INetSharingConfigurationForINetConnection($c)
+            if ($props.Name -eq $uplinkName)  { try { $cfg.EnableSharing(0); $okPub = $true } catch { } }
+            if ($props.Name -eq $privateName) { try { $cfg.EnableSharing(1); $okPriv = $true } catch { } }
+        } catch { }
     }
     return ($okPub -and $okPriv)
 }
@@ -755,7 +817,6 @@ $fresh    = @('Reachable', 'Probe', 'Delay', 'Permanent')
 # bandwidth sampling state (hotspot adapter counters)
 $hasStat  = [bool](Get-Command -Name Get-NetAdapterStatistics -ErrorAction SilentlyContinue)
 $bwIf     = [string]$sync.BwIfName
-$bwIdx    = [int]$sync.BwIfIndex
 $prevNow  = Get-Date
 $prevR    = -1L; $prevT = -1L
 $baseR    = 0L;  $baseT = 0L
@@ -886,20 +947,18 @@ while (-not $sync.StopScan) {
         if ($sync.SimBw.ContainsKey('t')) { $bwT = [double]$sync.SimBw['t'] }
         if ($bwR -ge 0 -or $bwT -ge 0) { $sync.BwOk = $true }
     }
-    elseif ($hasStat -and ($bwIdx -gt 0 -or $bwIf)) {
+    elseif ($hasStat -and $bwIf) {
         try {
-            # sample by interface INDEX with -IncludeHidden: the WFD
-            # virtual adapter is hidden, and its name contains a literal
-            # '*' which -Name would treat as a wildcard (multi-match ->
-            # array -> cast failure every cycle)
-            $stats = @()
-            if ($bwIdx -gt 0) {
-                $stats = @(Get-NetAdapterStatistics -InterfaceIndex $bwIdx -IncludeHidden -ErrorAction Stop)
-            }
-            else {
-                $stats = @(Get-NetAdapterStatistics -Name $bwIf -IncludeHidden -ErrorAction Stop |
-                           Where-Object { $_.Name -eq $bwIf })
-            }
+            # Get-NetAdapterStatistics accepts only -Name /
+            # -InterfaceDescription - there is NO -InterfaceIndex
+            # parameter, and the v2.3.0 call that used one failed every
+            # cycle, so the bandwidth strip never worked on real Windows
+            # (the test rig only exercises the sim path). The WFD
+            # adapter's name contains a literal '*' which -Name would
+            # treat as a wildcard, so enumerate everything (hidden
+            # adapters included) and match the exact name instead.
+            $stats = @(Get-NetAdapterStatistics -IncludeHidden -ErrorAction Stop |
+                       Where-Object { $_.Name -eq $bwIf })
             if ($stats.Count -ne 1) { throw 'adapter statistics not found' }
             $st = $stats[0]
             $r = [long]$st.ReceivedBytes
@@ -1361,7 +1420,6 @@ function Start-Hotspot {
     elseif ($icsAddr) { $sync.ServerIP = $icsAddr }
     else { $sync.ServerIP = "$runSub.1" }
     $sync.BwIfName    = $script:VAdapter.Name
-    $sync.BwIfIndex   = $script:VAdapter.InterfaceIndex
     $sync.GraceOnline = 0
     $sync.GraceRemove = 0
     $sync.Sim         = $false
@@ -1646,8 +1704,12 @@ function Clear-Sparkline {
 
 # =====================================================================
 # GUI (skipped entirely in self-test mode)
+# The whole GUI section runs inside a try/catch: any unhandled startup
+# error is written to studio-crash.log and raised in a message box
+# instead of red text flashing by in a console that closes itself.
 # =====================================================================
 if (-not $SelfTest) {
+try {
 
 # ---------- elevation ----------
 $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -2073,9 +2135,11 @@ $trayMenu.Items[1].Add_Click({ Invoke-StartHotspot })
 $trayMenu.Items[2].Add_Click({ Invoke-StopHotspot })
 $trayMenu.Items[4].Add_Click({ $form.Close() })
 $notifyIcon.Add_DoubleClick({ Show-MainForm })
-$form.Add_Resize({
-    if ($form.WindowState -eq 'Minimized') { $form.Hide() }
-})
+# v2.4.0: minimizing no longer hides the window into the tray. The old
+# Add_Resize -> Hide() made the app look closed as soon as the taskbar
+# button vanished (Windows 11 keeps new tray icons collapsed by
+# default). Minimize is a plain taskbar minimize now; the tray icon
+# remains for its right-click menu, and closing the window still exits.
 
 # =====================================================================
 # reservation dialog (built ONCE at top level and reused - event
@@ -2143,7 +2207,7 @@ function Refresh-ResvList {
 function Refresh-Uplinks {
     $sel = $cbUp.SelectedItem
     $cbUp.Items.Clear()
-    $adapters = @(Get-UplinkAdapters)
+    $adapters = @(Get-UplinkAdapters | Where-Object { $_ })
     foreach ($a in $adapters) { [void]$cbUp.Items.Add($a.Name) }
     if ($sel -and $cbUp.Items.Contains($sel)) { $cbUp.SelectedItem = $sel }
     elseif ($cbUp.Items.Count -gt 0) { $cbUp.SelectedIndex = 0 }
@@ -2627,6 +2691,7 @@ $timer.Add_Tick({
         Log 'Restart the hotspot to restore live tracking.'
         $status.Text = 'WARNING: device tracker died - restart the hotspot.'
         $status.ForeColor = $Red
+        return
     }
 
     # ---- publisher health ----
@@ -2661,8 +2726,10 @@ $timer.Add_Tick({
     $on = @($cl | Where-Object { $_.status -eq 'connected' }).Count
     $vrOn = 'OFF'
     if ((Test-Path $VrFlagFile) -or (Test-Path $VrFlagAlt)) { $vrOn = 'ON' }
-    $status.Text = ("RUNNING  |  SSID {0}  |  {1} device(s), {2} responsive  |  VR mode {3}" -f $tSsid.Text, $cl.Count, $on, $vrOn)
-    $status.ForeColor = $BodyText
+    if (-not $script:ScanDeadLogged) {
+        $status.Text = ("RUNNING  |  SSID {0}  |  {1} device(s), {2} responsive  |  VR mode {3}" -f $tSsid.Text, $cl.Count, $on, $vrOn)
+        $status.ForeColor = $BodyText
+    }
 })
 
 $form.Add_FormClosing({
@@ -2752,4 +2819,20 @@ $form.Add_Shown({
 $timer.Start()
 [void]$form.ShowDialog()
 
+}
+catch {
+    # unhandled error anywhere in the GUI startup path (before the
+    # dialog is up): record it where the user can find it, show a
+    # message box, exit
+    # nonzero so the .bat launcher keeps the console open with a hint.
+    $crashFile = Write-CrashLog $_
+    $crashNote = ''
+    if ($crashFile) { $crashNote = "Details were saved to:`n$crashFile" }
+    else            { $crashNote = 'Details could not be saved - the red text in the console window shows the error.' }
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        [System.Windows.Forms.MessageBox]::Show("VR Hotspot Studio hit an error:`n$($_.Exception.Message)`n`n$crashNote", 'VR Hotspot Studio') | Out-Null
+    } catch { }
+    exit 1
+}
 }   # end if (-not $SelfTest)

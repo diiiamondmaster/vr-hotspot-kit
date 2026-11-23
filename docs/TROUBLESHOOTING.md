@@ -7,6 +7,24 @@
 
 ## The app
 
+### The app will not start / a console asks to "supply values for the following parameters"
+Older builds could end up frozen on that PowerShell prompt with the
+window never appearing. Since v2.4.0 the launcher runs PowerShell with
+`-NonInteractive`, so a prompting command fails immediately with a
+visible error instead of hanging - and any unhandled startup error is
+written to `studio-crash.log` (next to the script, or `%TEMP%`
+vrhs-crash.log if the folder is read-only) and shown in a message box.
+If it happens to you: close the console, re-run
+`VR-Hotspot-Studio.bat`, and if a window still does not appear, open
+`studio-crash.log` - the last block contains the exact error to report
+(and so does any red PowerShell text left in the console; a script that
+fails to even parse exits before a log can be written).
+
+Related hardening in v2.4.0: the administrator check uses `fltmc`
+instead of `net session`, which needs the Server service - on heavily
+stripped Windows images that service can be missing, and the launcher
+used to loop on the elevation request instead of starting.
+
 ### The hotspot works but the connection stalls for a second every few minutes
 That is Windows' WLAN AutoConfig background scanning - the radio leaves your
 channel to look for other networks. The app's **VR mode** (on by default)
