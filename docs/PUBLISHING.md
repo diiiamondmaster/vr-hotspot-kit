@@ -58,6 +58,21 @@ The attached zip should contain the **runnable files only** - no `.git`,
 no maintainer tooling (the publisher scripts) - so it stays small and
 extract-and-run.
 
+## Debug builds ship alongside every release
+
+Standing policy since v2.9.0: **every release carries a second asset**,
+`vr-hotspot-kit-vX.X.X-debug.zip`, uploaded to the same GitHub Release.
+It is the same app built with full diagnostic logging (see
+[debug/README-DEBUG.md](../debug/README-DEBUG.md)) so a user reporting a
+problem can attach one file instead of copying log lines by hand.
+
+The debug build is **generated from the production script**, never
+maintained by hand: apply the debug instrumentation to the current
+`VR-Hotspot-Studio.ps1`, keep the `debug/` folder in the repo in sync,
+run the test suite against the debug file (the full production suite
+retargeted at it, plus the debug assertions), and upload both zips to
+the same release.
+
 ## The download path for users
 
 Once published, anyone (including you, from any machine) can:

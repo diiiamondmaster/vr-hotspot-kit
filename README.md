@@ -173,12 +173,26 @@ flaky. The checkbox state is remembered between runs.
   (deleted automatically when scans resume; if the app ever crashes while
   running, the next launch cleans it up)
 
+### Debug builds (ship alongside every release)
+
+Every release from v2.9.0 on also ships **`vr-hotspot-kit-vX.X.X-debug.zip`**
+on the same Releases page. It is the same app plus full instrumentation:
+run it instead of the normal build whenever a problem needs reporting -
+it records everything (a system survey at start, every log line with
+millisecond timestamps, DHCP packet detail, per-query DNS lines, 30 s
+state snapshots, the Windows WLAN event tail, crash records) to **one
+file**, `debug-logs\vrhs-debug-<timestamp>.log` next to the script,
+which you simply attach to your report. The hotspot password is never
+written. Details: [debug/README-DEBUG.md](debug/README-DEBUG.md) (also
+shipped inside the debug zip).
+
 ---
 
 ## Repository layout
 
 ```
 VR-Hotspot-Studio.bat / .ps1    the hotspot app (run the .bat)
+debug/                          the debug build (generated alongside every release)
 Publish-to-GitHub.bat / .ps1    one-click repo publisher (maintainer use)
 LICENSE                         MIT
 docs/
@@ -223,6 +237,17 @@ most common items:
 
 ## Version history
 
+- **v2.9.0-debug** - the first **debug build**, and a standing policy:
+  every release from now on ships one alongside the normal zip. Same
+  app, plus everything recorded to one submittable file - a system
+  survey at start (OS, PowerShell, Wi-Fi driver, adapters, addresses,
+  services, firewall, NAT, the last 12 h of WLAN-AutoConfig events),
+  every log line persisted with millisecond timestamps, DHCP DISCOVER
+  detail (requested IP, hostname, parameter list), per-query DNS lines
+  (name, answering resolver, bytes, latency), a `[snap]` state snapshot
+  every 30 s, new WLAN / system error events tailed every 60 s, and any
+  crash copied into the debug log before the app exits. The hotspot
+  password is never written. See "Debug builds" above.
 - **v2.9.0** - the Router mode reliability pass. Field reports put
   almost every remaining problem in Router mode (Shared mode, where
   Windows owns the plumbing, was stable), and four real defects
